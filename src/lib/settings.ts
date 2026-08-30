@@ -10,6 +10,8 @@ export const DEFAULT_SETTINGS: ReaderSettings = {
   sidebarCollapsed: false,
   windowSize: { width: 1180, height: 760 },
   recentFiles: [],
+  lastFolderPath: null,
+  lastFilePath: null,
 };
 
 const clamp = (value: number, minimum: number, maximum: number) =>
@@ -61,6 +63,14 @@ export function loadSettings(): ReaderSettings {
       recentFiles: Array.isArray(stored.recentFiles)
         ? stored.recentFiles.filter(isRecentFile).slice(0, MAX_RECENT_FILES)
         : [],
+      lastFolderPath:
+        typeof stored.lastFolderPath === "string" && stored.lastFolderPath.trim()
+          ? stored.lastFolderPath
+          : null,
+      lastFilePath:
+        typeof stored.lastFilePath === "string" && stored.lastFilePath.trim()
+          ? stored.lastFilePath
+          : null,
     };
   } catch {
     return DEFAULT_SETTINGS;
@@ -87,4 +97,3 @@ export function addRecentFile(
     ),
   ].slice(0, MAX_RECENT_FILES);
 }
-

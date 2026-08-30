@@ -12,7 +12,8 @@ interface TopBarProps {
   filePath?: string;
   theme: ThemeMode;
   canSearch: boolean;
-  onOpen: () => void;
+  onOpenFile: () => void;
+  onOpenFolder: () => void;
   onSearch: () => void;
   onCycleTheme: () => void;
 }
@@ -22,7 +23,8 @@ export function TopBar({
   filePath,
   theme,
   canSearch,
-  onOpen,
+  onOpenFile,
+  onOpenFolder,
   onSearch,
   onCycleTheme,
 }: TopBarProps) {
@@ -34,9 +36,23 @@ export function TopBar({
         <FileText size={19} />
         <span>MD Reader</span>
       </div>
-      <button className="top-bar__primary" type="button" onClick={onOpen} title="Open file (Ctrl+O)">
-        <FolderOpen size={16} />
+      <button
+        className="top-bar__primary"
+        type="button"
+        onClick={onOpenFile}
+        title="Open file (Ctrl+O)"
+      >
+        <FileText size={16} />
         <span>Open File</span>
+      </button>
+      <button
+        className="top-bar__primary"
+        type="button"
+        onClick={onOpenFolder}
+        title="Open folder (Ctrl+Shift+O)"
+      >
+        <FolderOpen size={16} />
+        <span>Open Folder</span>
       </button>
       <div className="top-bar__filename" title={filePath}>
         {filename ?? "No document open"}
@@ -63,4 +79,3 @@ export function TopBar({
     </header>
   );
 }
-

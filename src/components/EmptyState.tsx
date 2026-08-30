@@ -15,7 +15,7 @@ export function EmptyState({ recentFiles, onOpen, onSelectRecent }: EmptyStatePr
           <FileText size={30} />
         </div>
         <h1>Read Markdown without the clutter</h1>
-        <p>Open a local .md or .markdown file, or drop one anywhere in this window.</p>
+        <p>Open a local Markdown file or folder, or drop either anywhere in this window.</p>
         <button type="button" onClick={onOpen}>
           <FolderOpen size={17} />
           Open Markdown File
@@ -44,4 +44,3 @@ export function EmptyState({ recentFiles, onOpen, onSelectRecent }: EmptyStatePr
     </div>
   );
 }
-

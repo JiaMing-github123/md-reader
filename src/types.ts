@@ -19,6 +19,8 @@ export interface ReaderSettings {
   sidebarCollapsed: boolean;
   windowSize: WindowSize;
   recentFiles: RecentFile[];
+  lastFolderPath: string | null;
+  lastFilePath: string | null;
 }
 
 export interface MarkdownDocument {
@@ -33,3 +35,11 @@ export interface TocItem {
   level: 1 | 2 | 3;
 }
 
+export interface FileTreeNode {
+  name: string;
+  path: string;
+  kind: "folder" | "file";
+  children: FileTreeNode[];
+}
+
+export type SidebarTab = "files" | "contents";

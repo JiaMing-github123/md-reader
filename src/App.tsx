@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
-import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
+import { open as openPathDialog } from "@tauri-apps/plugin-dialog";
 import { AlertCircle, FileDown, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { EmptyState } from "./components/EmptyState";
@@ -14,9 +14,11 @@ import { useDocumentSearch } from "./hooks/useDocumentSearch";
 import { extractTableOfContents, isMarkdownPath } from "./lib/markdown";
 import { addRecentFile, loadSettings, saveSettings } from "./lib/settings";
 import type {
+  FileTreeNode,
   MarkdownDocument,
   ReaderSettings,
   ResolvedTheme,
+  SidebarTab,
   ThemeMode,
 } from "./types";
 
@@ -30,10 +32,22 @@ function errorMessage(error: unknown): string {
   return "Something went wrong while opening the file.";
 }
 
+interface OpenDocumentOptions {
+  keepFilesTab?: boolean;
+  silent?: boolean;
+}
+
+interface OpenFolderOptions {
+  silent?: boolean;
+}
+
 export default function App() {
   const [settings, setSettings] = useState<ReaderSettings>(loadSettings);
   const [documentFile, setDocumentFile] = useState<MarkdownDocument | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [folderTree, setFolderTree] = useState<FileTreeNode | null>(null);
+  const [sidebarTab, setSidebarTab] = useState<SidebarTab>("contents");
+  const [fileLoading, setFileLoading] = useState(false);
+  const [folderLoading, setFolderLoading] = useState(false);
   const [error, setError] = useState("");
   const [dragActive, setDragActive] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -45,6 +59,9 @@ export default function App() {
   const articleRef = useRef<HTMLElement>(null);
   const scrollRef = useRef<HTMLElement>(null);
   const openRequestId = useRef(0);
+  const folderRequestId = useRef(0);
+  const externalOpenEpoch = useRef(0);
+  const initialSettings = useRef(settings);
 
   const resolvedTheme: ResolvedTheme =
     settings.theme === "system" ? (systemDark ? "dark" : "light") : settings.theme;
@@ -69,34 +86,68 @@ export default function App() {
   );
 
   const openDocument = useCallback(
-    async (path: string) => {
+    async (path: string, options: OpenDocumentOptions = {}): Promise<boolean> => {
       if (!isMarkdownPath(path)) {
-        setError("Only .md and .markdown files can be opened.");
-        return;
+        if (!options.silent) setError("Only .md and .markdown files can be opened.");
+        return false;
       }
 
       const requestId = ++openRequestId.current;
-      setLoading(true);
-      setError("");
+      setFileLoading(true);
+      if (!options.silent) setError("");
 
       try {
         const opened = await invoke<MarkdownDocument>("read_markdown_file", { path });
-        if (requestId !== openRequestId.current) return;
+        if (requestId !== openRequestId.current) return false;
         setDocumentFile(opened);
+        if (!options.keepFilesTab) setSidebarTab("contents");
         setSearchOpen(false);
         setSearchQuery("");
         scrollRef.current?.scrollTo({ top: 0 });
         updateSettings((current) => ({
           ...current,
+          lastFilePath: opened.path,
           recentFiles: addRecentFile(current.recentFiles, {
             path: opened.path,
             name: opened.name,
           }),
         }));
+        return true;
       } catch (openError) {
-        if (requestId === openRequestId.current) setError(errorMessage(openError));
+        if (requestId === openRequestId.current && !options.silent) {
+          setError(errorMessage(openError));
+        }
+        return false;
       } finally {
-        if (requestId === openRequestId.current) setLoading(false);
+        if (requestId === openRequestId.current) setFileLoading(false);
+      }
+    },
+    [updateSettings],
+  );
+
+  const openFolder = useCallback(
+    async (path: string, options: OpenFolderOptions = {}): Promise<boolean> => {
+      const requestId = ++folderRequestId.current;
+      setFolderLoading(true);
+      if (!options.silent) setError("");
+
+      try {
+        const opened = await invoke<FileTreeNode>("scan_markdown_folder", { path });
+        if (requestId !== folderRequestId.current) return false;
+        setFolderTree(opened);
+        setSidebarTab("files");
+        updateSettings((current) => ({
+          ...current,
+          lastFolderPath: opened.path,
+        }));
+        return true;
+      } catch (openError) {
+        if (requestId === folderRequestId.current && !options.silent) {
+          setError(errorMessage(openError));
+        }
+        return false;
+      } finally {
+        if (requestId === folderRequestId.current) setFolderLoading(false);
       }
     },
     [updateSettings],
@@ -104,7 +155,7 @@ export default function App() {
 
   const chooseFile = useCallback(async () => {
     try {
-      const selected = await openFileDialog({
+      const selected = await openPathDialog({
         multiple: false,
         directory: false,
         title: "Open Markdown File",
@@ -115,6 +166,19 @@ export default function App() {
       setError(errorMessage(dialogError));
     }
   }, [openDocument]);
+
+  const chooseFolder = useCallback(async () => {
+    try {
+      const selected = await openPathDialog({
+        multiple: false,
+        directory: true,
+        title: "Open Markdown Folder",
+      });
+      if (typeof selected === "string") await openFolder(selected);
+    } catch (dialogError) {
+      setError(errorMessage(dialogError));
+    }
+  }, [openFolder]);
 
   const closeSearch = useCallback(() => {
     setSearchOpen(false);
@@ -169,10 +233,39 @@ export default function App() {
     const connect = async () => {
       try {
         unlistenRequested = await listen<string>("open-file-requested", (event) => {
+          externalOpenEpoch.current += 1;
+          folderRequestId.current += 1;
+          setFolderLoading(false);
           void openDocument(event.payload);
         });
+        const restoreEpoch = externalOpenEpoch.current;
         const startupFile = await invoke<string | null>("get_startup_file");
-        if (!cancelled && startupFile) await openDocument(startupFile);
+        if (cancelled) return;
+
+        if (startupFile) {
+          externalOpenEpoch.current += 1;
+          await openDocument(startupFile);
+          return;
+        }
+
+        if (restoreEpoch !== externalOpenEpoch.current) return;
+        const saved = initialSettings.current;
+
+        if (saved.lastFolderPath) {
+          const restoredFolder = await openFolder(saved.lastFolderPath, { silent: true });
+          if (cancelled || restoreEpoch !== externalOpenEpoch.current) return;
+          if (!restoredFolder) {
+            updateSettings((current) => ({ ...current, lastFolderPath: null }));
+          }
+        }
+
+        if (saved.lastFilePath) {
+          const restoredFile = await openDocument(saved.lastFilePath, { silent: true });
+          if (cancelled || restoreEpoch !== externalOpenEpoch.current) return;
+          if (!restoredFile) {
+            updateSettings((current) => ({ ...current, lastFilePath: null }));
+          }
+        }
       } catch {
         // Vite's browser-only preview has no desktop bridge.
       }
@@ -183,7 +276,7 @@ export default function App() {
       cancelled = true;
       unlistenRequested?.();
     };
-  }, [openDocument]);
+  }, [openDocument, openFolder, updateSettings]);
 
   useEffect(() => {
     let unlistenDragDrop: (() => void) | undefined;
@@ -196,9 +289,28 @@ export default function App() {
           if (event.payload.type === "leave") setDragActive(false);
           if (event.payload.type === "drop") {
             setDragActive(false);
-            const markdownFile = event.payload.paths.find(isMarkdownPath);
-            if (markdownFile) void openDocument(markdownFile);
-            else setError("Drop a .md or .markdown file to open it.");
+            const droppedPaths = event.payload.paths;
+            void (async () => {
+              try {
+                for (const path of droppedPaths) {
+                  const pathKind = await invoke<"folder" | "markdown" | "unsupported">(
+                    "classify_path",
+                    { path },
+                  );
+                  if (pathKind === "folder") {
+                    await openFolder(path);
+                    return;
+                  }
+                  if (pathKind === "markdown") {
+                    await openDocument(path);
+                    return;
+                  }
+                }
+                setError("Drop a Markdown file or a folder to open it.");
+              } catch {
+                setError("This dropped path could not be opened.");
+              }
+            })();
           }
         });
         if (cancelled) unlistenDragDrop();
@@ -212,7 +324,7 @@ export default function App() {
       cancelled = true;
       unlistenDragDrop?.();
     };
-  }, [openDocument]);
+  }, [openDocument, openFolder]);
 
   useEffect(() => {
     let cancelled = false;
@@ -268,7 +380,8 @@ export default function App() {
       const key = event.key.toLocaleLowerCase();
       if (key === "o") {
         event.preventDefault();
-        void chooseFile();
+        if (event.shiftKey) void chooseFolder();
+        else void chooseFile();
       } else if (key === "f") {
         event.preventDefault();
         if (documentFile) setSearchOpen(true);
@@ -286,7 +399,7 @@ export default function App() {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [changeFontSize, chooseFile, closeSearch, documentFile, searchOpen]);
+  }, [changeFontSize, chooseFile, chooseFolder, closeSearch, documentFile, searchOpen]);
 
   useEffect(() => {
     const scrollContainer = scrollRef.current;
@@ -332,18 +445,23 @@ export default function App() {
         filePath={documentFile?.path}
         theme={settings.theme}
         canSearch={Boolean(documentFile)}
-        onOpen={chooseFile}
+        onOpenFile={chooseFile}
+        onOpenFolder={chooseFolder}
         onSearch={() => setSearchOpen(true)}
         onCycleTheme={cycleTheme}
       />
 
       <div className="workspace">
-        {documentFile && (
+        {(folderTree || documentFile) && (
           <Sidebar
+            fileTree={folderTree}
             items={tableOfContents}
             width={settings.sidebarWidth}
             collapsed={settings.sidebarCollapsed}
             activeId={activeHeading}
+            activeFilePath={documentFile?.path ?? ""}
+            activeTab={sidebarTab}
+            refreshing={folderLoading}
             onToggle={() =>
               updateSettings((current) => ({
                 ...current,
@@ -353,6 +471,11 @@ export default function App() {
             onWidthChange={(sidebarWidth) =>
               updateSettings((current) => ({ ...current, sidebarWidth }))
             }
+            onTabChange={setSidebarTab}
+            onOpenFile={(path) => void openDocument(path, { keepFilesTab: true })}
+            onRefresh={() => {
+              if (folderTree) void openFolder(folderTree.path);
+            }}
             onNavigate={navigateToHeading}
           />
         )}
@@ -402,10 +525,10 @@ export default function App() {
         </main>
       </div>
 
-      {loading && (
+      {(fileLoading || folderLoading) && (
         <div className="loading-indicator" role="status">
           <span />
-          Opening document…
+          {folderLoading ? "Scanning folder…" : "Opening document…"}
         </div>
       )}
 
@@ -413,12 +536,11 @@ export default function App() {
         <div className="drop-overlay">
           <div>
             <FileDown size={34} />
-            <strong>Drop to open Markdown</strong>
-            <span>.md and .markdown files</span>
+            <strong>Drop to open</strong>
+            <span>Markdown files or folders</span>
           </div>
         </div>
       )}
     </div>
   );
 }
-
