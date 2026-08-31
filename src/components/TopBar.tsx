@@ -2,6 +2,7 @@ import {
   BookOpen,
   FileText,
   FolderOpen,
+  House,
   LoaderCircle,
   Monitor,
   Moon,
@@ -26,8 +27,10 @@ interface TopBarProps {
   dirty: boolean;
   saving: boolean;
   saveStatus: string;
+  canGoHome: boolean;
   canSearch: boolean;
   canEdit: boolean;
+  onHome: () => void;
   onOpenFile: () => void;
   onOpenFolder: () => void;
   onSearch: () => void;
@@ -44,8 +47,10 @@ export function TopBar({
   dirty,
   saving,
   saveStatus,
+  canGoHome,
   canSearch,
   canEdit,
+  onHome,
   onOpenFile,
   onOpenFolder,
   onSearch,
@@ -61,6 +66,16 @@ export function TopBar({
         <FileText size={19} />
         <span>MD Reader</span>
       </div>
+      <button
+        className="top-bar__primary"
+        type="button"
+        onClick={onHome}
+        disabled={!canGoHome}
+        title="Go to home"
+      >
+        <House size={16} />
+        <span>Home</span>
+      </button>
       <button
         className="top-bar__primary"
         type="button"

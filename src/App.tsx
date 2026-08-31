@@ -66,6 +66,7 @@ interface SaveCommandError {
 
 interface OpenDocumentOptions {
   keepFilesTab?: boolean;
+  restoreScrollPosition?: boolean;
   silent?: boolean;
 }
 
@@ -159,8 +160,6 @@ export default function App() {
   const scrollRef = useRef<HTMLElement>(null);
   const openRequestId = useRef(0);
   const folderRequestId = useRef(0);
-  const externalOpenEpoch = useRef(0);
-  const initialSettings = useRef(settings);
   const settingsRef = useRef(settings);
   const scrollPositionsRef = useRef(settings.scrollPositions);
   const visibleDocumentPathRef = useRef("");
@@ -485,7 +484,9 @@ export default function App() {
         flushCurrentScrollPosition();
         pendingScrollRestoreRef.current = {
           path: opened.path,
-          position: scrollPositionsRef.current[opened.path] ?? 0,
+          position: options.restoreScrollPosition
+            ? (scrollPositionsRef.current[opened.path] ?? 0)
+            : 0,
         };
         applyOpenedDocument(opened);
         if (recovery && recoveryChoice === "recover") {
@@ -811,6 +812,50 @@ export default function App() {
     (path: string, options: OpenFolderOptions = {}) =>
       runGuardedAction(() => loadFolder(path, options)),
     [loadFolder, runGuardedAction],
+  );
+
+  const goHome = useCallback(
+    () =>
+      runGuardedAction(async () => {
+        flushCurrentScrollPosition();
+        openRequestId.current += 1;
+        folderRequestId.current += 1;
+        documentTokenRef.current += 1;
+        draftVersionRef.current += 1;
+        documentFileRef.current = null;
+        diskContentRef.current = "";
+        draftContentRef.current = "";
+        diskRevisionRef.current = "";
+        dirtyRef.current = false;
+        readerModeRef.current = "read";
+        visibleDocumentPathRef.current = "";
+        lastScrollPositionRef.current = null;
+        pendingScrollRestoreRef.current = null;
+        cancelPendingPreview();
+        updateExternalChange(null);
+        setDocumentFile(null);
+        setDiskContent("");
+        setDraftContent("");
+        setPreviewContent("");
+        setReaderMode("read");
+        setSaveSignal("saved");
+        setFolderTree(null);
+        setSidebarTab("contents");
+        setActiveHeading("");
+        setFileLoading(false);
+        setFolderLoading(false);
+        setError("");
+        setRecoveryWarning("");
+        setNotice("");
+        closeSearch();
+      }),
+    [
+      cancelPendingPreview,
+      closeSearch,
+      flushCurrentScrollPosition,
+      runGuardedAction,
+      updateExternalChange,
+    ],
   );
 
   const chooseFile = useCallback(async () => {
@@ -1218,38 +1263,15 @@ export default function App() {
     const connect = async () => {
       try {
         unlistenRequested = await listen<string>("open-file-requested", (event) => {
-          externalOpenEpoch.current += 1;
           folderRequestId.current += 1;
           setFolderLoading(false);
           void openDocument(event.payload);
         });
-        const restoreEpoch = externalOpenEpoch.current;
         const startupFile = await invoke<string | null>("get_startup_file");
         if (cancelled) return;
 
         if (startupFile) {
-          externalOpenEpoch.current += 1;
           await loadDocument(startupFile);
-          return;
-        }
-
-        if (restoreEpoch !== externalOpenEpoch.current) return;
-        const saved = initialSettings.current;
-
-        if (saved.lastFolderPath) {
-          const restoredFolder = await loadFolder(saved.lastFolderPath, { silent: true });
-          if (cancelled || restoreEpoch !== externalOpenEpoch.current) return;
-          if (!restoredFolder) {
-            updateSettings((current) => ({ ...current, lastFolderPath: null }));
-          }
-        }
-
-        if (saved.lastFilePath) {
-          const restoredFile = await loadDocument(saved.lastFilePath, { silent: true });
-          if (cancelled || restoreEpoch !== externalOpenEpoch.current) return;
-          if (!restoredFile) {
-            updateSettings((current) => ({ ...current, lastFilePath: null }));
-          }
         }
       } catch {
         // Vite's browser-only preview has no desktop bridge.
@@ -1261,7 +1283,7 @@ export default function App() {
       cancelled = true;
       unlistenRequested?.();
     };
-  }, [loadDocument, loadFolder, openDocument, updateSettings]);
+  }, [loadDocument, openDocument]);
 
   useEffect(() => {
     let unlistenDragDrop: (() => void) | undefined;
@@ -1542,8 +1564,10 @@ export default function App() {
         dirty={isDirty}
         saving={saving}
         saveStatus={saveStatus}
+        canGoHome={Boolean(documentFile || folderTree)}
         canSearch={Boolean(documentFile)}
         canEdit={Boolean(documentFile)}
+        onHome={() => void goHome()}
         onOpenFile={chooseFile}
         onOpenFolder={chooseFolder}
         onSearch={openSearch}
@@ -1684,7 +1708,9 @@ export default function App() {
             <EmptyState
               recentFiles={settings.recentFiles}
               onOpen={chooseFile}
-              onSelectRecent={(path) => void openDocument(path)}
+              onSelectRecent={(path) =>
+                void openDocument(path, { restoreScrollPosition: true })
+              }
             />
           )}
         </main>
