@@ -9,7 +9,15 @@ import {
   ListTree,
   RefreshCw,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MutableRefObject,
+} from "react";
 import type { FileTreeNode, SidebarTab, TocItem } from "../types";
 
 interface SidebarProps {
@@ -20,6 +28,7 @@ interface SidebarProps {
   activeId: string;
   activeFilePath: string;
   activeTab: SidebarTab;
+  showContents: boolean;
   refreshing: boolean;
   onToggle: () => void;
   onWidthChange: (width: number) => void;
@@ -60,6 +69,38 @@ interface FileTreeItemProps {
   onToggleFolder: (path: string) => void;
   onOpenFile: (path: string) => void;
 }
+
+interface TocButtonsProps {
+  items: TocItem[];
+  buttonsRef: MutableRefObject<Map<string, HTMLButtonElement>>;
+  onNavigate: (id: string) => void;
+}
+
+const TocButtons = memo(function TocButtons({
+  items,
+  buttonsRef,
+  onNavigate,
+}: TocButtonsProps) {
+  return (
+    <>
+      {items.map((item) => (
+        <button
+          type="button"
+          key={item.id}
+          ref={(element) => {
+            if (element) buttonsRef.current.set(item.id, element);
+            else buttonsRef.current.delete(item.id);
+          }}
+          style={{ paddingLeft: `${12 + (item.level - 1) * 14}px` }}
+          onClick={() => onNavigate(item.id)}
+          title={item.text}
+        >
+          {item.text}
+        </button>
+      ))}
+    </>
+  );
+});
 
 function FileTreeItem({
   node,
@@ -123,6 +164,7 @@ export function Sidebar({
   activeId,
   activeFilePath,
   activeTab,
+  showContents,
   refreshing,
   onToggle,
   onWidthChange,
@@ -133,6 +175,8 @@ export function Sidebar({
 }: SidebarProps) {
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const activePath = useMemo(() => comparablePath(activeFilePath), [activeFilePath]);
+  const tocButtonsRef = useRef<Map<string, HTMLButtonElement>>(new Map());
+  const previousActiveIdRef = useRef("");
 
   useEffect(() => {
     setExpandedFolders(new Set());
@@ -146,6 +190,17 @@ export function Sidebar({
 
     setExpandedFolders((current) => new Set([...current, ...activeAncestors]));
   }, [activePath, fileTree]);
+
+  useEffect(() => {
+    const previousButton = tocButtonsRef.current.get(previousActiveIdRef.current);
+    previousButton?.classList.remove("is-active");
+    previousButton?.removeAttribute("aria-current");
+
+    const activeButton = tocButtonsRef.current.get(activeId);
+    activeButton?.classList.add("is-active");
+    activeButton?.setAttribute("aria-current", "location");
+    previousActiveIdRef.current = activeId;
+  }, [activeId, activeTab, items, onNavigate]);
 
   const toggleFolder = useCallback((path: string) => {
     setExpandedFolders((current) => {
@@ -206,17 +261,19 @@ export function Sidebar({
             <Files size={14} />
             Files
           </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={activeTab === "contents"}
-            className={activeTab === "contents" ? "is-active" : undefined}
-            disabled={!activeFilePath}
-            onClick={() => onTabChange("contents")}
-          >
-            <ListTree size={14} />
-            Contents
-          </button>
+          {showContents && (
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === "contents"}
+              className={activeTab === "contents" ? "is-active" : undefined}
+              disabled={!activeFilePath}
+              onClick={() => onTabChange("contents")}
+            >
+              <ListTree size={14} />
+              Contents
+            </button>
+          )}
         </div>
         <button className="sidebar__collapse" type="button" onClick={onToggle} title="Hide navigation">
           <ChevronLeft size={17} />
@@ -259,18 +316,11 @@ export function Sidebar({
       ) : (
         <nav className="sidebar__nav" aria-label="Table of contents">
           {items.length > 0 ? (
-            items.map((item) => (
-              <button
-                type="button"
-                key={item.id}
-                className={activeId === item.id ? "is-active" : undefined}
-                style={{ paddingLeft: `${12 + (item.level - 1) * 14}px` }}
-                onClick={() => onNavigate(item.id)}
-                title={item.text}
-              >
-                {item.text}
-              </button>
-            ))
+            <TocButtons
+              items={items}
+              buttonsRef={tocButtonsRef}
+              onNavigate={onNavigate}
+            />
           ) : (
             <p>No H1–H3 headings in this document.</p>
           )}

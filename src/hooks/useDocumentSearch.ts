@@ -5,10 +5,17 @@ interface HighlightRegistry {
   delete(name: string): void;
 }
 
+interface SearchableTextNode {
+  node: Text;
+  foldedText: string;
+}
+
 type HighlightConstructor = new (...ranges: Range[]) => unknown;
 
 const RESULTS_HIGHLIGHT = "md-reader-search-results";
 const ACTIVE_HIGHLIGHT = "md-reader-search-active";
+const SEARCH_DEBOUNCE_MS = 150;
+const MAX_HIGHLIGHT_RANGES = 2000;
 
 function highlightApi(): {
   registry: HighlightRegistry | null;
@@ -26,11 +33,8 @@ function clearHighlights(): void {
   registry?.delete(ACTIVE_HIGHLIGHT);
 }
 
-function findRanges(container: HTMLElement, query: string): Range[] {
-  const ranges: Range[] = [];
-  const needle = query.toLocaleLowerCase();
-  if (!needle) return ranges;
-
+function buildSearchIndex(container: HTMLElement): SearchableTextNode[] {
+  const nodes: SearchableTextNode[] = [];
   const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
       const parent = node.parentElement;
@@ -46,26 +50,42 @@ function findRanges(container: HTMLElement, query: string): Range[] {
     },
   });
 
-  let textNode = walker.nextNode();
-  while (textNode) {
-    const text = textNode.textContent ?? "";
-    const haystack = text.toLocaleLowerCase();
-    let start = 0;
-
-    while (start <= haystack.length - needle.length) {
-      const matchIndex = haystack.indexOf(needle, start);
-      if (matchIndex < 0) break;
-      const range = document.createRange();
-      range.setStart(textNode, matchIndex);
-      range.setEnd(textNode, matchIndex + needle.length);
-      ranges.push(range);
-      start = matchIndex + Math.max(needle.length, 1);
-    }
-
-    textNode = walker.nextNode();
+  let node = walker.nextNode();
+  while (node) {
+    const text = node.textContent ?? "";
+    nodes.push({ node: node as Text, foldedText: text.toLocaleLowerCase() });
+    node = walker.nextNode();
   }
 
-  return ranges;
+  return nodes;
+}
+
+function findRanges(
+  index: SearchableTextNode[],
+  query: string,
+): { ranges: Range[]; limitExceeded: boolean } {
+  const ranges: Range[] = [];
+  const needle = query.toLocaleLowerCase();
+  if (!needle) return { ranges, limitExceeded: false };
+
+  for (const entry of index) {
+    let start = 0;
+    while (start <= entry.foldedText.length - needle.length) {
+      const matchIndex = entry.foldedText.indexOf(needle, start);
+      if (matchIndex < 0) break;
+      if (ranges.length === MAX_HIGHLIGHT_RANGES) {
+        return { ranges, limitExceeded: true };
+      }
+
+      const range = document.createRange();
+      range.setStart(entry.node, matchIndex);
+      range.setEnd(entry.node, matchIndex + needle.length);
+      ranges.push(range);
+      start = matchIndex + needle.length;
+    }
+  }
+
+  return { ranges, limitExceeded: false };
 }
 
 export function useDocumentSearch(
@@ -73,36 +93,64 @@ export function useDocumentSearch(
   scrollRef: React.RefObject<HTMLElement>,
   query: string,
   documentKey: string,
+  documentContent: string,
+  renderKey: string,
 ) {
+  const indexRef = useRef<SearchableTextNode[]>([]);
   const rangesRef = useRef<Range[]>([]);
+  const searchGenerationRef = useRef(0);
   const [matchCount, setMatchCount] = useState(0);
+  const [matchLimitExceeded, setMatchLimitExceeded] = useState(false);
   const [currentMatch, setCurrentMatch] = useState(0);
 
   useEffect(() => {
+    searchGenerationRef.current += 1;
+    clearHighlights();
+    rangesRef.current = [];
+    indexRef.current = articleRef.current ? buildSearchIndex(articleRef.current) : [];
+
+    return () => {
+      searchGenerationRef.current += 1;
+      indexRef.current = [];
+      rangesRef.current = [];
+      clearHighlights();
+    };
+  }, [articleRef, documentContent, documentKey, renderKey]);
+
+  useEffect(() => {
+    const generation = ++searchGenerationRef.current;
     clearHighlights();
     rangesRef.current = [];
     setMatchCount(0);
+    setMatchLimitExceeded(false);
     setCurrentMatch(0);
 
-    if (!query.trim() || !articleRef.current) return;
+    const normalizedQuery = query.trim();
+    if (!normalizedQuery || !documentKey) return;
 
-    const frame = requestAnimationFrame(() => {
-      if (!articleRef.current) return;
-      const ranges = findRanges(articleRef.current, query.trim());
+    const timer = window.setTimeout(() => {
+      if (generation !== searchGenerationRef.current) return;
+      const { ranges, limitExceeded } = findRanges(indexRef.current, normalizedQuery);
+      if (generation !== searchGenerationRef.current) return;
+
       rangesRef.current = ranges;
       setMatchCount(ranges.length);
+      setMatchLimitExceeded(limitExceeded);
 
       const { registry, Highlight } = highlightApi();
       if (registry && Highlight && ranges.length > 0) {
         registry.set(RESULTS_HIGHLIGHT, new Highlight(...ranges));
       }
-    });
+    }, SEARCH_DEBOUNCE_MS);
 
     return () => {
-      cancelAnimationFrame(frame);
+      window.clearTimeout(timer);
+      if (generation === searchGenerationRef.current) {
+        searchGenerationRef.current += 1;
+      }
       clearHighlights();
     };
-  }, [articleRef, documentKey, query]);
+  }, [documentContent, documentKey, query, renderKey]);
 
   useEffect(() => {
     const ranges = rangesRef.current;
@@ -146,9 +194,9 @@ export function useDocumentSearch(
 
   return {
     matchCount,
+    matchLimitExceeded,
     currentMatch: matchCount > 0 ? currentMatch + 1 : 0,
     next,
     previous,
   };
 }
-

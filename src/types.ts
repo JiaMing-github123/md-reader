@@ -1,5 +1,6 @@
 export type ThemeMode = "system" | "light" | "dark";
 export type ResolvedTheme = "light" | "dark";
+export type ReaderMode = "read" | "edit";
 
 export interface RecentFile {
   path: string;
@@ -21,6 +22,7 @@ export interface ReaderSettings {
   recentFiles: RecentFile[];
   lastFolderPath: string | null;
   lastFilePath: string | null;
+  scrollPositions: Record<string, number>;
 }
 
 export interface MarkdownDocument {

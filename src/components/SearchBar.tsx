@@ -5,6 +5,8 @@ interface SearchBarProps {
   query: string;
   currentMatch: number;
   matchCount: number;
+  matchLimitExceeded: boolean;
+  focusRequest: number;
   onQueryChange: (query: string) => void;
   onNext: () => void;
   onPrevious: () => void;
@@ -15,6 +17,8 @@ export function SearchBar({
   query,
   currentMatch,
   matchCount,
+  matchLimitExceeded,
+  focusRequest,
   onQueryChange,
   onNext,
   onPrevious,
@@ -25,7 +29,7 @@ export function SearchBar({
   useEffect(() => {
     inputRef.current?.focus();
     inputRef.current?.select();
-  }, []);
+  }, [focusRequest]);
 
   return (
     <div className="search-bar" role="search">
@@ -46,14 +50,16 @@ export function SearchBar({
         spellCheck={false}
       />
       <span className="search-bar__count" aria-live="polite">
-        {query ? `${currentMatch} / ${matchCount}` : "0 / 0"}
+        {query
+          ? `${currentMatch} / ${matchLimitExceeded ? "2000+" : matchCount}`
+          : "0 / 0"}
       </span>
       <button
         type="button"
         onClick={onPrevious}
         disabled={matchCount === 0}
         aria-label="Previous match"
-        title="Previous match (Shift+Enter)"
+        title="Previous match (Shift+Enter or Shift+F3)"
       >
         <ChevronUp size={17} />
       </button>
@@ -62,7 +68,7 @@ export function SearchBar({
         onClick={onNext}
         disabled={matchCount === 0}
         aria-label="Next match"
-        title="Next match (Enter)"
+        title="Next match (Enter or F3)"
       >
         <ChevronDown size={17} />
       </button>
@@ -72,4 +78,3 @@ export function SearchBar({
     </div>
   );
 }
-

@@ -2,6 +2,7 @@ import type { ReaderSettings, RecentFile, ThemeMode } from "../types";
 
 const STORAGE_KEY = "md-reader.settings.v1";
 const MAX_RECENT_FILES = 10;
+const MAX_SCROLL_POSITIONS = 50;
 
 export const DEFAULT_SETTINGS: ReaderSettings = {
   theme: "system",
@@ -12,6 +13,7 @@ export const DEFAULT_SETTINGS: ReaderSettings = {
   recentFiles: [],
   lastFolderPath: null,
   lastFilePath: null,
+  scrollPositions: {},
 };
 
 const clamp = (value: number, minimum: number, maximum: number) =>
@@ -29,6 +31,23 @@ const isRecentFile = (value: unknown): value is RecentFile => {
     typeof candidate.openedAt === "number"
   );
 };
+
+function loadScrollPositions(value: unknown): Record<string, number> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+
+  const validEntries = Object.entries(value)
+    .filter(
+      (entry): entry is [string, number] =>
+        entry[0].trim().length > 0 &&
+        typeof entry[1] === "number" &&
+        Number.isFinite(entry[1]) &&
+        entry[1] >= 0,
+    )
+    .slice(-MAX_SCROLL_POSITIONS)
+    .map(([path, position]) => [path, Math.round(position)] as const);
+
+  return Object.fromEntries(validEntries);
+}
 
 export function loadSettings(): ReaderSettings {
   try {
@@ -71,6 +90,7 @@ export function loadSettings(): ReaderSettings {
         typeof stored.lastFilePath === "string" && stored.lastFilePath.trim()
           ? stored.lastFilePath
           : null,
+      scrollPositions: loadScrollPositions(stored.scrollPositions),
     };
   } catch {
     return DEFAULT_SETTINGS;
@@ -83,6 +103,19 @@ export function saveSettings(settings: ReaderSettings): void {
   } catch {
     // The reader remains usable if storage is unavailable.
   }
+}
+
+export function rememberScrollPosition(
+  scrollPositions: Record<string, number>,
+  canonicalPath: string,
+  position: number,
+): Record<string, number> {
+  const path = canonicalPath.trim();
+  if (!path || !Number.isFinite(position)) return scrollPositions;
+
+  const entries = Object.entries(scrollPositions).filter(([storedPath]) => storedPath !== path);
+  entries.push([path, Math.max(0, Math.round(position))]);
+  return Object.fromEntries(entries.slice(-MAX_SCROLL_POSITIONS));
 }
 
 export function addRecentFile(
