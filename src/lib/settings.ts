@@ -1,12 +1,17 @@
-import type { ReaderSettings, RecentFile, ThemeMode } from "../types";
+import type { EditLayout, ReaderSettings, RecentFile, ThemeMode } from "../types";
 
 const STORAGE_KEY = "md-reader.settings.v1";
 const MAX_RECENT_FILES = 10;
 const MAX_SCROLL_POSITIONS = 50;
+export const AUTO_SAVE_DELAYS = [2000, 3000, 5000, 10000] as const;
 
 export const DEFAULT_SETTINGS: ReaderSettings = {
   theme: "system",
   fontSize: 17,
+  autoSaveEnabled: false,
+  autoSaveDelayMs: 3000,
+  editLayout: "split",
+  editorSplitRatio: 0.5,
   sidebarWidth: 272,
   sidebarCollapsed: false,
   windowSize: { width: 1180, height: 760 },
@@ -21,6 +26,9 @@ const clamp = (value: number, minimum: number, maximum: number) =>
 
 const isTheme = (value: unknown): value is ThemeMode =>
   value === "system" || value === "light" || value === "dark";
+
+const isEditLayout = (value: unknown): value is EditLayout =>
+  value === "editor" || value === "split" || value === "preview";
 
 const isRecentFile = (value: unknown): value is RecentFile => {
   if (!value || typeof value !== "object") return false;
@@ -61,6 +69,23 @@ export function loadSettings(): ReaderSettings {
         typeof stored.fontSize === "number"
           ? clamp(stored.fontSize, 14, 24)
           : DEFAULT_SETTINGS.fontSize,
+      autoSaveEnabled:
+        typeof stored.autoSaveEnabled === "boolean"
+          ? stored.autoSaveEnabled
+          : DEFAULT_SETTINGS.autoSaveEnabled,
+      autoSaveDelayMs: AUTO_SAVE_DELAYS.includes(
+        stored.autoSaveDelayMs as (typeof AUTO_SAVE_DELAYS)[number],
+      )
+        ? (stored.autoSaveDelayMs as (typeof AUTO_SAVE_DELAYS)[number])
+        : DEFAULT_SETTINGS.autoSaveDelayMs,
+      editLayout: isEditLayout(stored.editLayout)
+        ? stored.editLayout
+        : DEFAULT_SETTINGS.editLayout,
+      editorSplitRatio:
+        typeof stored.editorSplitRatio === "number" &&
+        Number.isFinite(stored.editorSplitRatio)
+          ? clamp(stored.editorSplitRatio, 0.3, 0.7)
+          : DEFAULT_SETTINGS.editorSplitRatio,
       sidebarWidth:
         typeof stored.sidebarWidth === "number"
           ? clamp(stored.sidebarWidth, 200, 420)

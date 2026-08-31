@@ -25,6 +25,7 @@ interface TopBarProps {
   readerMode: ReaderMode;
   dirty: boolean;
   saving: boolean;
+  saveStatus: string;
   canSearch: boolean;
   canEdit: boolean;
   onOpenFile: () => void;
@@ -42,6 +43,7 @@ export function TopBar({
   readerMode,
   dirty,
   saving,
+  saveStatus,
   canSearch,
   canEdit,
   onOpenFile,
@@ -82,6 +84,11 @@ export function TopBar({
         {dirty && (
           <span className="top-bar__dirty" title="Unsaved changes" aria-label="Unsaved changes">
             ●
+          </span>
+        )}
+        {filename && (
+          <span className="top-bar__save-status" aria-live="polite">
+            {saveStatus}
           </span>
         )}
       </div>

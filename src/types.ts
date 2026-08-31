@@ -1,6 +1,7 @@
 export type ThemeMode = "system" | "light" | "dark";
 export type ResolvedTheme = "light" | "dark";
 export type ReaderMode = "read" | "edit";
+export type EditLayout = "editor" | "split" | "preview";
 
 export interface RecentFile {
   path: string;
@@ -16,6 +17,10 @@ export interface WindowSize {
 export interface ReaderSettings {
   theme: ThemeMode;
   fontSize: number;
+  autoSaveEnabled: boolean;
+  autoSaveDelayMs: number;
+  editLayout: EditLayout;
+  editorSplitRatio: number;
   sidebarWidth: number;
   sidebarCollapsed: boolean;
   windowSize: WindowSize;
@@ -29,6 +34,22 @@ export interface MarkdownDocument {
   path: string;
   name: string;
   content: string;
+  revision: string;
+}
+
+export interface RecoveryDraft {
+  canonicalPath: string;
+  filename: string;
+  draftContent: string;
+  baseRevision: string;
+  updatedTimestamp: number;
+  appVersion: string;
+  schemaVersion: number;
+}
+
+export interface FileRevision {
+  status: "exists" | "missing";
+  revision: string | null;
 }
 
 export interface TocItem {

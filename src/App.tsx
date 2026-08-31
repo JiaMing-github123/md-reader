@@ -16,8 +16,8 @@ import {
   DecisionDialog,
   type DialogAction,
 } from "./components/DecisionDialog";
+import { EditWorkspace } from "./components/EditWorkspace";
 import { EmptyState } from "./components/EmptyState";
-import { MarkdownEditor } from "./components/MarkdownEditor";
 import { MarkdownView } from "./components/MarkdownView";
 import { SearchBar } from "./components/SearchBar";
 import { Sidebar } from "./components/Sidebar";
@@ -31,8 +31,11 @@ import {
   saveSettings,
 } from "./lib/settings";
 import type {
+  EditLayout,
+  FileRevision,
   FileTreeNode,
   MarkdownDocument,
+  RecoveryDraft,
   ReaderMode,
   ReaderSettings,
   ResolvedTheme,
@@ -43,6 +46,9 @@ import type {
 const FONT_SIZE_MIN = 14;
 const FONT_SIZE_MAX = 24;
 const SCROLL_SAVE_DEBOUNCE_MS = 180;
+const PREVIEW_DEBOUNCE_MS = 150;
+const RECOVERY_DEBOUNCE_MS = 1000;
+const EXTERNAL_CHECK_INTERVAL_MS = 2000;
 const ACTIVE_HEADING_OFFSET = 110;
 const themeOrder: ThemeMode[] = ["system", "light", "dark"];
 
@@ -76,6 +82,15 @@ interface DecisionState {
 }
 
 type SaveOutcome = "saved" | "reloaded" | "cancelled" | "failed";
+type SaveAttempt = "saved" | "conflict" | "failed" | "stale" | "busy";
+type SaveSignal = "saved" | "unsaved" | "draft-protected" | "save-failed";
+
+interface ExternalChangeState {
+  kind: "changed" | "missing";
+  observedRevision: string | null;
+  dismissed: boolean;
+  recoveryBaseMismatch?: boolean;
+}
 
 function errorMessage(error: unknown): string {
   if (typeof error === "string") return error;
@@ -118,8 +133,13 @@ export default function App() {
   const [documentFile, setDocumentFile] = useState<MarkdownDocument | null>(null);
   const [diskContent, setDiskContent] = useState("");
   const [draftContent, setDraftContent] = useState("");
+  const [previewContent, setPreviewContent] = useState("");
   const [readerMode, setReaderMode] = useState<ReaderMode>("read");
   const [saving, setSaving] = useState(false);
+  const [saveSignal, setSaveSignal] = useState<SaveSignal>("saved");
+  const [externalChange, setExternalChange] = useState<ExternalChangeState | null>(null);
+  const [recoveryWarning, setRecoveryWarning] = useState("");
+  const [notice, setNotice] = useState("");
   const [folderTree, setFolderTree] = useState<FileTreeNode | null>(null);
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>("contents");
   const [fileLoading, setFileLoading] = useState(false);
@@ -149,17 +169,38 @@ export default function App() {
   const documentFileRef = useRef<MarkdownDocument | null>(null);
   const diskContentRef = useRef("");
   const draftContentRef = useRef("");
+  const diskRevisionRef = useRef("");
+  const documentTokenRef = useRef(0);
+  const draftVersionRef = useRef(0);
+  const previewTimerRef = useRef<number | undefined>(undefined);
+  const previewUpdateEpochRef = useRef(0);
   const dirtyRef = useRef(false);
   const readerModeRef = useRef<ReaderMode>("read");
   const savingRef = useRef(false);
+  const saveInFlightRef = useRef<Promise<SaveAttempt> | null>(null);
+  const recoveryTimerRef = useRef<number | undefined>(undefined);
+  const recoveryQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const externalChangeRef = useRef<ExternalChangeState | null>(null);
   const pendingActionRef = useRef(false);
-  const allowWindowCloseRef = useRef(false);
   const decisionRef = useRef<DecisionState | null>(null);
   const decisionResolverRef = useRef<((value: string) => void) | null>(null);
 
   const isDirty = draftContent !== diskContent;
   const resolvedTheme: ResolvedTheme =
     settings.theme === "system" ? (systemDark ? "dark" : "light") : settings.theme;
+  const saveStatus = saving
+    ? "Saving…"
+    : externalChange
+      ? settings.autoSaveEnabled && isDirty
+        ? "Auto Save paused"
+        : "File changed externally"
+      : saveSignal === "save-failed"
+        ? "Save failed"
+        : isDirty && saveSignal === "draft-protected"
+          ? "Draft protected"
+          : isDirty
+            ? "Unsaved"
+            : "Saved";
 
   const tableOfContents = useMemo(
     () => extractTableOfContents(draftContent),
@@ -186,6 +227,34 @@ export default function App() {
     [],
   );
 
+  const updateExternalChange = useCallback((change: ExternalChangeState | null) => {
+    externalChangeRef.current = change;
+    setExternalChange(change);
+  }, []);
+
+  const queueRecoveryOperation = useCallback((operation: () => Promise<void>) => {
+    const next = recoveryQueueRef.current.catch(() => undefined).then(operation);
+    recoveryQueueRef.current = next.catch(() => undefined);
+    return next;
+  }, []);
+
+  const deleteRecoveryDraft = useCallback(
+    async (path: string): Promise<boolean> => {
+      try {
+        await queueRecoveryOperation(() =>
+          invoke<void>("delete_recovery_draft", { path }),
+        );
+        return true;
+      } catch (deleteError) {
+        setRecoveryWarning(
+          `The recovery draft could not be deleted and was left in place: ${errorMessage(deleteError)}`,
+        );
+        return false;
+      }
+    },
+    [queueRecoveryOperation],
+  );
+
   const storeScrollPosition = useCallback(
     (path: string, position: number) => {
       const scrollPositions = rememberScrollPosition(
@@ -209,35 +278,112 @@ export default function App() {
     setSearchQuery("");
   }, []);
 
+  const cancelPendingPreview = useCallback(() => {
+    window.clearTimeout(previewTimerRef.current);
+    previewTimerRef.current = undefined;
+    previewUpdateEpochRef.current += 1;
+  }, []);
+
+  const syncPreviewContent = useCallback(
+    (content: string) => {
+      cancelPendingPreview();
+      setPreviewContent(content);
+    },
+    [cancelPendingPreview],
+  );
+
+  const schedulePreviewContent = useCallback((content: string) => {
+    window.clearTimeout(previewTimerRef.current);
+    const updateEpoch = ++previewUpdateEpochRef.current;
+    const documentPath = documentFileRef.current?.path ?? "";
+
+    if (!documentPath) {
+      previewTimerRef.current = undefined;
+      setPreviewContent("");
+      return;
+    }
+
+    previewTimerRef.current = window.setTimeout(() => {
+      if (
+        updateEpoch !== previewUpdateEpochRef.current ||
+        comparablePath(documentFileRef.current?.path ?? "") !== comparablePath(documentPath)
+      ) {
+        return;
+      }
+      previewTimerRef.current = undefined;
+      setPreviewContent(content);
+    }, PREVIEW_DEBOUNCE_MS);
+  }, []);
+
+  useEffect(() => () => cancelPendingPreview(), [cancelPendingPreview]);
+
+  const chooseDecision = useCallback((value: string) => {
+    const resolve = decisionResolverRef.current;
+    if (!resolve) return;
+    decisionResolverRef.current = null;
+    decisionRef.current = null;
+    setDecision(null);
+    resolve(value);
+  }, []);
+
+  const askDecision = useCallback((nextDecision: DecisionState): Promise<string> => {
+    if (decisionResolverRef.current) return Promise.resolve(nextDecision.cancelValue);
+    (document.activeElement as HTMLElement | null)?.blur();
+    decisionRef.current = nextDecision;
+    setDecision(nextDecision);
+    return new Promise((resolve) => {
+      decisionResolverRef.current = resolve;
+    });
+  }, []);
+
   const applyOpenedDocument = useCallback(
     (opened: MarkdownDocument) => {
+      documentTokenRef.current += 1;
+      draftVersionRef.current += 1;
       documentFileRef.current = opened;
       diskContentRef.current = opened.content;
       draftContentRef.current = opened.content;
+      diskRevisionRef.current = opened.revision;
       dirtyRef.current = false;
       readerModeRef.current = "read";
+      updateExternalChange(null);
       setDocumentFile(opened);
       setDiskContent(opened.content);
       setDraftContent(opened.content);
+      syncPreviewContent(opened.content);
       setReaderMode("read");
+      setSaveSignal("saved");
       setActiveHeading("");
       closeSearch();
     },
-    [closeSearch],
+    [closeSearch, syncPreviewContent, updateExternalChange],
   );
 
   const updateDraftContent = useCallback((content: string) => {
+    draftVersionRef.current += 1;
     draftContentRef.current = content;
     dirtyRef.current = content !== diskContentRef.current;
     setDraftContent(content);
-  }, []);
+    setSaveSignal(content === diskContentRef.current ? "saved" : "unsaved");
+    const observedChange = externalChangeRef.current;
+    if (observedChange?.dismissed && content !== diskContentRef.current) {
+      updateExternalChange({ ...observedChange, dismissed: false });
+    }
+    schedulePreviewContent(content);
+  }, [schedulePreviewContent, updateExternalChange]);
 
-  const discardDraft = useCallback(() => {
+  const discardDraft = useCallback(async (): Promise<boolean> => {
+    const path = documentFileRef.current?.path;
+    if (path && !(await deleteRecoveryDraft(path))) return false;
+    draftVersionRef.current += 1;
     const content = diskContentRef.current;
     draftContentRef.current = content;
     dirtyRef.current = false;
     setDraftContent(content);
-  }, []);
+    syncPreviewContent(content);
+    setSaveSignal("saved");
+    return true;
+  }, [deleteRecoveryDraft, syncPreviewContent]);
 
   const loadDocument = useCallback(
     async (path: string, options: OpenDocumentOptions = {}): Promise<boolean> => {
@@ -252,14 +398,114 @@ export default function App() {
       if (!options.silent) setError("");
 
       try {
-        const opened = await invoke<MarkdownDocument>("read_markdown_file", { path });
+        let opened: MarkdownDocument;
+        try {
+          opened = await invoke<MarkdownDocument>("read_markdown_file", { path });
+        } catch (openError) {
+          if (requestId !== openRequestId.current) return false;
+          try {
+            const revision = await invoke<FileRevision>("get_file_revision", { path });
+            const recovery = await invoke<RecoveryDraft | null>("load_recovery_draft", {
+              path,
+            });
+            if (revision.status === "missing" && recovery) {
+              const choice = await askDecision({
+                title: "File no longer exists on disk",
+                message: `${recovery.filename} was moved or deleted, but its recovery draft is still protected.`,
+                detail: "Copy keeps the recovery record. Only Discard Draft deletes it.",
+                cancelValue: "cancel",
+                actions: [
+                  { label: "Copy Draft", value: "copy", tone: "primary" },
+                  { label: "Discard Draft", value: "discard", tone: "danger" },
+                  { label: "Cancel", value: "cancel", autoFocus: true },
+                ],
+              });
+              if (choice === "copy") {
+                try {
+                  await navigator.clipboard.writeText(recovery.draftContent);
+                  setNotice("Recovery draft copied. The protected recovery record was kept.");
+                } catch (copyError) {
+                  setRecoveryWarning(
+                    `The draft could not be copied; its recovery record was kept: ${errorMessage(copyError)}`,
+                  );
+                }
+              } else if (choice === "discard") {
+                await deleteRecoveryDraft(recovery.canonicalPath);
+              }
+              return false;
+            }
+          } catch (recoveryError) {
+            setRecoveryWarning(errorMessage(recoveryError));
+          }
+          throw openError;
+        }
         if (requestId !== openRequestId.current) return false;
+
+        let recovery: RecoveryDraft | null = null;
+        try {
+          recovery = await invoke<RecoveryDraft | null>("load_recovery_draft", {
+            path: opened.path,
+          });
+        } catch (recoveryError) {
+          setRecoveryWarning(errorMessage(recoveryError));
+        }
+        if (requestId !== openRequestId.current) return false;
+
+        let recoveryChoice: "recover" | "discard" | null = null;
+        if (recovery) {
+          if (recovery.draftContent === opened.content) {
+            await deleteRecoveryDraft(opened.path);
+            recovery = null;
+          } else {
+            const diskAlsoChanged = recovery.baseRevision !== opened.revision;
+            const choice = await askDecision({
+              title: "Recovery draft found",
+              message: `${recovery.filename} has a protected draft from ${new Date(
+                recovery.updatedTimestamp * 1000,
+              ).toLocaleString()}.`,
+              detail: diskAlsoChanged
+                ? "The disk file was also modified after this draft was created. Recover loads the draft as unsaved and requires explicit conflict resolution before writing."
+                : "Recover loads the draft as unsaved and does not write it to the Markdown file.",
+              cancelValue: "cancel",
+              actions: [
+                { label: "Recover Draft", value: "recover", tone: "primary" },
+                { label: "Discard Draft", value: "discard", tone: "danger" },
+                { label: "Cancel", value: "cancel", autoFocus: true },
+              ],
+            });
+            if (choice === "cancel") return false;
+            recoveryChoice = choice === "recover" ? "recover" : "discard";
+            if (recoveryChoice === "discard") {
+              if (!(await deleteRecoveryDraft(opened.path))) return false;
+              recovery = null;
+            }
+          }
+        }
+
         flushCurrentScrollPosition();
         pendingScrollRestoreRef.current = {
           path: opened.path,
           position: scrollPositionsRef.current[opened.path] ?? 0,
         };
         applyOpenedDocument(opened);
+        if (recovery && recoveryChoice === "recover") {
+          draftVersionRef.current += 1;
+          draftContentRef.current = recovery.draftContent;
+          dirtyRef.current = true;
+          readerModeRef.current = "edit";
+          setDraftContent(recovery.draftContent);
+          syncPreviewContent(recovery.draftContent);
+          setReaderMode("edit");
+          setSaveSignal("draft-protected");
+          if (recovery.baseRevision !== opened.revision) {
+            updateExternalChange({
+              kind: "changed",
+              observedRevision: opened.revision,
+              dismissed: false,
+              recoveryBaseMismatch: true,
+            });
+          }
+        }
         if (!options.keepFilesTab) setSidebarTab("contents");
         updateSettings((current) => ({
           ...current,
@@ -279,7 +525,15 @@ export default function App() {
         if (requestId === openRequestId.current) setFileLoading(false);
       }
     },
-    [applyOpenedDocument, flushCurrentScrollPosition, updateSettings],
+    [
+      applyOpenedDocument,
+      askDecision,
+      deleteRecoveryDraft,
+      flushCurrentScrollPosition,
+      syncPreviewContent,
+      updateExternalChange,
+      updateSettings,
+    ],
   );
 
   const loadFolder = useCallback(
@@ -310,87 +564,156 @@ export default function App() {
     [updateSettings],
   );
 
-  const chooseDecision = useCallback((value: string) => {
-    const resolve = decisionResolverRef.current;
-    if (!resolve) return;
-    decisionResolverRef.current = null;
-    decisionRef.current = null;
-    setDecision(null);
-    resolve(value);
-  }, []);
+  const performSave = useCallback(
+    (overwriteConflict: boolean): Promise<SaveAttempt> => {
+      const targetDocument = documentFileRef.current;
+      if (!targetDocument || !dirtyRef.current) return Promise.resolve("saved");
+      if (saveInFlightRef.current) return Promise.resolve("busy");
 
-  const askDecision = useCallback((nextDecision: DecisionState): Promise<string> => {
-    if (decisionResolverRef.current) return Promise.resolve(nextDecision.cancelValue);
-    (document.activeElement as HTMLElement | null)?.blur();
-    decisionRef.current = nextDecision;
-    setDecision(nextDecision);
-    return new Promise((resolve) => {
-      decisionResolverRef.current = resolve;
-    });
-  }, []);
+      const targetPath = targetDocument.path;
+      const targetToken = documentTokenRef.current;
+      const contentSnapshot = draftContentRef.current;
+      const expectedContent = diskContentRef.current;
+      const draftVersion = draftVersionRef.current;
+      savingRef.current = true;
+      setSaving(true);
+      setSaveSignal("unsaved");
+      setError("");
 
-  const saveCurrentDocument = useCallback(async (): Promise<SaveOutcome> => {
-    const targetDocument = documentFileRef.current;
-    if (!targetDocument || !dirtyRef.current) return "saved";
-    if (savingRef.current) return "cancelled";
+      let task: Promise<SaveAttempt>;
+      task = (async () => {
+        try {
+          const saved = await invoke<MarkdownDocument>("write_markdown_file", {
+            path: targetPath,
+            content: contentSnapshot,
+            expectedContent,
+            overwriteConflict,
+          });
+          const current = documentFileRef.current;
+          if (
+            !current ||
+            documentTokenRef.current !== targetToken ||
+            comparablePath(current.path) !== comparablePath(targetPath)
+          ) {
+            return "stale";
+          }
 
-    const targetPath = targetDocument.path;
-    const contentToSave = draftContentRef.current;
-    const expectedContent = diskContentRef.current;
-    savingRef.current = true;
-    setSaving(true);
-    setError("");
-
-    const applySavedDocument = (saved: MarkdownDocument): SaveOutcome => {
-      const current = documentFileRef.current;
-      if (!current || comparablePath(current.path) !== comparablePath(targetPath)) {
-        return "cancelled";
-      }
-
-      const updated = { ...current, ...saved };
-      documentFileRef.current = updated;
-      diskContentRef.current = saved.content;
-      dirtyRef.current = draftContentRef.current !== saved.content;
-      setDocumentFile(updated);
-      setDiskContent(saved.content);
-      return "saved";
-    };
-
-    const write = (overwriteConflict: boolean) =>
-      invoke<MarkdownDocument>("write_markdown_file", {
-        path: targetPath,
-        content: contentToSave,
-        expectedContent,
-        overwriteConflict,
-      });
-
-    try {
-      try {
-        return applySavedDocument(await write(false));
-      } catch (saveError) {
-        const structuredError = saveCommandError(saveError);
-        if (structuredError?.kind !== "conflict") {
+          const updated = { ...current, ...saved };
+          documentFileRef.current = updated;
+          diskContentRef.current = saved.content;
+          diskRevisionRef.current = saved.revision;
+          dirtyRef.current = draftContentRef.current !== saved.content;
+          setDocumentFile(updated);
+          setDiskContent(saved.content);
+          updateExternalChange(null);
+          if (
+            draftVersionRef.current === draftVersion &&
+            draftContentRef.current === saved.content
+          ) {
+            setSaveSignal("saved");
+            void deleteRecoveryDraft(targetPath);
+          } else {
+            setSaveSignal("unsaved");
+          }
+          return "saved";
+        } catch (saveError) {
+          const structuredError = saveCommandError(saveError);
+          if (structuredError?.kind === "conflict") {
+            updateExternalChange({
+              kind: "changed",
+              observedRevision: null,
+              dismissed: false,
+            });
+            setSaveSignal("unsaved");
+            return "conflict";
+          }
           setError(structuredError?.message ?? errorMessage(saveError));
+          setSaveSignal("save-failed");
           return "failed";
+        } finally {
+          saveInFlightRef.current = null;
+          savingRef.current = false;
+          setSaving(false);
         }
+      })();
+      saveInFlightRef.current = task;
+      return task;
+    },
+    [deleteRecoveryDraft, updateExternalChange],
+  );
+
+  const reloadCurrentDocument = useCallback(
+    async (targetPath: string, targetToken: number): Promise<SaveOutcome> => {
+      try {
+        const scrollPosition = scrollRef.current?.scrollTop ?? 0;
+        const reloaded = await invoke<MarkdownDocument>("read_markdown_file", {
+          path: targetPath,
+        });
+        const current = documentFileRef.current;
+        if (
+          !current ||
+          documentTokenRef.current !== targetToken ||
+          comparablePath(current.path) !== comparablePath(targetPath)
+        ) {
+          return "cancelled";
+        }
+        if (!(await deleteRecoveryDraft(targetPath))) return "failed";
+        draftVersionRef.current += 1;
+        documentFileRef.current = reloaded;
+        diskContentRef.current = reloaded.content;
+        draftContentRef.current = reloaded.content;
+        diskRevisionRef.current = reloaded.revision;
+        dirtyRef.current = false;
+        updateExternalChange(null);
+        setDocumentFile(reloaded);
+        setDiskContent(reloaded.content);
+        setDraftContent(reloaded.content);
+        syncPreviewContent(reloaded.content);
+        setSaveSignal("saved");
+        if (readerModeRef.current === "read") {
+          pendingScrollRestoreRef.current = {
+            path: reloaded.path,
+            position: scrollPosition,
+          };
+        }
+        closeSearch();
+        return "reloaded";
+      } catch (reloadError) {
+        setError(errorMessage(reloadError));
+        setSaveSignal("save-failed");
+        return "failed";
       }
+    },
+    [closeSearch, deleteRecoveryDraft, syncPreviewContent, updateExternalChange],
+  );
 
-      const conflictChoice = await askDecision({
-        title: "File changed on disk",
-        message:
-          "Another program changed this file after it was opened. Your draft has not been written.",
-        detail: "Reload uses the disk version. Overwrite is only performed if you choose it explicitly.",
-        cancelValue: "cancel",
-        actions: [
-          { label: "Reload", value: "reload" },
-          { label: "Overwrite", value: "overwrite", tone: "danger" },
-          { label: "Cancel", value: "cancel", autoFocus: true },
-        ],
-      });
+  const resolveExternalConflict = useCallback(async (): Promise<SaveOutcome> => {
+    const target = documentFileRef.current;
+    const conflict = externalChangeRef.current;
+    if (!target || !conflict) return "cancelled";
+    if (conflict.kind === "missing") {
+      setError("The file no longer exists on disk. Your draft remains protected; Save As is not available in this version.");
+      return "failed";
+    }
 
-      if (conflictChoice === "cancel") return "cancelled";
+    const targetPath = target.path;
+    const targetToken = documentTokenRef.current;
+    const conflictChoice = await askDecision({
+      title: "Resolve external file change",
+      message:
+        "The disk file and this document are no longer the same. Your recovery draft will be kept unless a chosen action succeeds.",
+      detail: "Overwrite only runs after you explicitly select it; Auto Save never overwrites a conflict.",
+      cancelValue: "cancel",
+      actions: [
+        { label: "Reload", value: "reload" },
+        { label: "Overwrite", value: "overwrite", tone: "danger" },
+        { label: "Cancel", value: "cancel", autoFocus: true },
+      ],
+    });
+    if (conflictChoice === "cancel") return "cancelled";
 
-      if (conflictChoice === "reload") {
+    if (conflictChoice === "reload") {
+      if (dirtyRef.current) {
         const reloadChoice = await askDecision({
           title: "Discard your unsaved draft?",
           message:
@@ -402,49 +725,48 @@ export default function App() {
           ],
         });
         if (reloadChoice !== "reload") return "cancelled";
-
-        try {
-          const reloaded = await invoke<MarkdownDocument>("read_markdown_file", {
-            path: targetPath,
-          });
-          const current = documentFileRef.current;
-          if (!current || comparablePath(current.path) !== comparablePath(targetPath)) {
-            return "cancelled";
-          }
-          documentFileRef.current = reloaded;
-          diskContentRef.current = reloaded.content;
-          draftContentRef.current = reloaded.content;
-          dirtyRef.current = false;
-          setDocumentFile(reloaded);
-          setDiskContent(reloaded.content);
-          setDraftContent(reloaded.content);
-          closeSearch();
-          return "reloaded";
-        } catch (reloadError) {
-          setError(errorMessage(reloadError));
-          return "failed";
-        }
       }
-
-      try {
-        return applySavedDocument(await write(true));
-      } catch (overwriteError) {
-        const structuredError = saveCommandError(overwriteError);
-        setError(structuredError?.message ?? errorMessage(overwriteError));
-        return "failed";
-      }
-    } finally {
-      savingRef.current = false;
-      setSaving(false);
+      return reloadCurrentDocument(targetPath, targetToken);
     }
-  }, [askDecision, closeSearch]);
+
+    if (saveInFlightRef.current) await saveInFlightRef.current;
+    const result = await performSave(true);
+    return result === "saved" ? "saved" : result === "stale" ? "cancelled" : "failed";
+  }, [askDecision, performSave, reloadCurrentDocument]);
+
+  const saveCurrentDocument = useCallback(async (): Promise<SaveOutcome> => {
+    if (saveInFlightRef.current) await saveInFlightRef.current;
+    if (!documentFileRef.current || !dirtyRef.current) return "saved";
+    if (externalChangeRef.current) return resolveExternalConflict();
+
+    const result = await performSave(false);
+    if (result === "conflict") return resolveExternalConflict();
+    if (result === "saved") return "saved";
+    return result === "stale" ? "cancelled" : "failed";
+  }, [performSave, resolveExternalConflict]);
+
+  const reloadExternalChange = useCallback(async () => {
+    const target = documentFileRef.current;
+    if (!target) return;
+    if (dirtyRef.current) {
+      await resolveExternalConflict();
+      return;
+    }
+    await reloadCurrentDocument(target.path, documentTokenRef.current);
+  }, [reloadCurrentDocument, resolveExternalConflict]);
+
+  const dismissExternalChange = useCallback(() => {
+    const current = externalChangeRef.current;
+    if (current) updateExternalChange({ ...current, dismissed: true });
+  }, [updateExternalChange]);
 
   const runGuardedAction = useCallback(
     async (action: () => Promise<boolean | void>): Promise<boolean> => {
-      if (pendingActionRef.current || savingRef.current) return false;
+      if (pendingActionRef.current) return false;
       pendingActionRef.current = true;
 
       try {
+        if (saveInFlightRef.current) await saveInFlightRef.current;
         if (dirtyRef.current) {
           const filename = documentFileRef.current?.name ?? "this document";
           const choice = await askDecision({
@@ -464,7 +786,7 @@ export default function App() {
             const outcome = await saveCurrentDocument();
             if (outcome !== "saved" || dirtyRef.current) return false;
           } else {
-            discardDraft();
+            if (!(await discardDraft())) return false;
           }
         }
 
@@ -518,6 +840,42 @@ export default function App() {
     }
   }, [openFolder]);
 
+  const changeEditLayout = useCallback(
+    (editLayout: EditLayout) => {
+      if (editLayout !== "editor") syncPreviewContent(draftContentRef.current);
+      updateSettings((current) =>
+        current.editLayout === editLayout ? current : { ...current, editLayout },
+      );
+    },
+    [syncPreviewContent, updateSettings],
+  );
+
+  const commitEditorSplitRatio = useCallback(
+    (editorSplitRatio: number) => {
+      updateSettings((current) =>
+        current.editorSplitRatio === editorSplitRatio
+          ? current
+          : { ...current, editorSplitRatio },
+      );
+    },
+    [updateSettings],
+  );
+
+  const changeAutoSaveEnabled = useCallback(
+    (autoSaveEnabled: boolean) => {
+      updateSettings((current) => ({ ...current, autoSaveEnabled }));
+    },
+    [updateSettings],
+  );
+
+  const changeAutoSaveDelay = useCallback(
+    (autoSaveDelayMs: number) => {
+      if (![2000, 3000, 5000, 10000].includes(autoSaveDelayMs)) return;
+      updateSettings((current) => ({ ...current, autoSaveDelayMs }));
+    },
+    [updateSettings],
+  );
+
   const changeReaderMode = useCallback(
     (mode: ReaderMode) => {
       if (mode === "edit" && !documentFileRef.current) return;
@@ -526,6 +884,9 @@ export default function App() {
       if (mode === "edit") {
         flushCurrentScrollPosition();
         closeSearch();
+        if (settingsRef.current.editLayout !== "editor") {
+          syncPreviewContent(draftContentRef.current);
+        }
         if (folderTree) setSidebarTab("files");
       } else {
         const path = documentFileRef.current?.path;
@@ -540,7 +901,7 @@ export default function App() {
       readerModeRef.current = mode;
       setReaderMode(mode);
     },
-    [closeSearch, flushCurrentScrollPosition, folderTree],
+    [closeSearch, flushCurrentScrollPosition, folderTree, syncPreviewContent],
   );
 
   const openSearch = useCallback(() => {
@@ -571,6 +932,188 @@ export default function App() {
   }, [updateSettings]);
 
   useEffect(() => saveSettings(settings), [settings]);
+
+  useEffect(() => {
+    window.clearTimeout(recoveryTimerRef.current);
+    recoveryTimerRef.current = undefined;
+    const current = documentFile;
+    if (!current) return;
+
+    const path = current.path;
+    const token = documentTokenRef.current;
+    if (draftContent === diskContent) {
+      void deleteRecoveryDraft(path);
+      return;
+    }
+
+    const draftSnapshot = draftContent;
+    const draftVersion = draftVersionRef.current;
+    const baseRevision = diskRevisionRef.current;
+    recoveryTimerRef.current = window.setTimeout(() => {
+      if (
+        documentTokenRef.current !== token ||
+        comparablePath(documentFileRef.current?.path ?? "") !== comparablePath(path) ||
+        draftVersionRef.current !== draftVersion ||
+        draftContentRef.current !== draftSnapshot ||
+        draftContentRef.current === diskContentRef.current
+      ) {
+        return;
+      }
+
+      recoveryTimerRef.current = undefined;
+      void queueRecoveryOperation(() =>
+        invoke<RecoveryDraft>("save_recovery_draft", {
+          path,
+          draftContent: draftSnapshot,
+          baseRevision,
+        }).then(() => undefined),
+      )
+        .then(() => {
+          if (
+            documentTokenRef.current === token &&
+            draftVersionRef.current === draftVersion &&
+            dirtyRef.current
+          ) {
+            setRecoveryWarning("");
+            setSaveSignal("draft-protected");
+          }
+        })
+        .catch((recoveryError) => {
+          if (documentTokenRef.current === token) {
+            setRecoveryWarning(
+              `Recovery draft protection failed; editing and manual Save are still available: ${errorMessage(
+                recoveryError,
+              )}`,
+            );
+          }
+        });
+    }, RECOVERY_DEBOUNCE_MS);
+
+    return () => {
+      window.clearTimeout(recoveryTimerRef.current);
+      recoveryTimerRef.current = undefined;
+    };
+  }, [
+    deleteRecoveryDraft,
+    diskContent,
+    documentFile,
+    draftContent,
+    queueRecoveryOperation,
+  ]);
+
+  useEffect(() => {
+    let timer: number | undefined;
+    if (
+      settings.autoSaveEnabled &&
+      documentFile &&
+      isDirty &&
+      !saving &&
+      !externalChange &&
+      !decision
+    ) {
+      const token = documentTokenRef.current;
+      const version = draftVersionRef.current;
+      timer = window.setTimeout(() => {
+        if (
+          documentTokenRef.current !== token ||
+          draftVersionRef.current !== version ||
+          !dirtyRef.current ||
+          savingRef.current ||
+          externalChangeRef.current ||
+          decisionRef.current
+        ) {
+          return;
+        }
+        void performSave(false);
+      }, settings.autoSaveDelayMs);
+    }
+    return () => window.clearTimeout(timer);
+  }, [
+    decision,
+    documentFile,
+    draftContent,
+    externalChange,
+    isDirty,
+    performSave,
+    saving,
+    settings.autoSaveDelayMs,
+    settings.autoSaveEnabled,
+  ]);
+
+  useEffect(() => {
+    const current = documentFile;
+    if (!current) return;
+    const path = current.path;
+    const token = documentTokenRef.current;
+    let interval: number | undefined;
+    let checkInProgress = false;
+    let stopped = false;
+
+    const check = async () => {
+      if (stopped || checkInProgress || document.visibilityState !== "visible") return;
+      checkInProgress = true;
+      try {
+        const latest = await invoke<FileRevision>("get_file_revision", { path });
+        if (
+          stopped ||
+          documentTokenRef.current !== token ||
+          comparablePath(documentFileRef.current?.path ?? "") !== comparablePath(path)
+        ) {
+          return;
+        }
+
+        const observed = externalChangeRef.current;
+        if (latest.status === "missing") {
+          if (observed?.kind !== "missing") {
+            updateExternalChange({
+              kind: "missing",
+              observedRevision: null,
+              dismissed: false,
+            });
+          }
+          return;
+        }
+
+        if (latest.revision === diskRevisionRef.current) {
+          if (observed && !observed.recoveryBaseMismatch) updateExternalChange(null);
+          return;
+        }
+        if (
+          observed?.kind === "changed" &&
+          observed.observedRevision === latest.revision
+        ) {
+          return;
+        }
+        updateExternalChange({
+          kind: "changed",
+          observedRevision: latest.revision,
+          dismissed: false,
+        });
+      } catch {
+        // A transient revision check failure must not interrupt editing or saving.
+      } finally {
+        checkInProgress = false;
+      }
+    };
+
+    const start = () => {
+      window.clearInterval(interval);
+      if (document.visibilityState !== "visible") return;
+      void check();
+      interval = window.setInterval(() => void check(), EXTERNAL_CHECK_INTERVAL_MS);
+    };
+    const handleVisibility = () => start();
+    const handleFocus = () => void check();
+    start();
+    document.addEventListener("visibilitychange", handleVisibility);
+    window.addEventListener("focus", handleFocus);
+    return () => {
+      stopped = true;
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", handleVisibility);
+      window.removeEventListener("focus", handleFocus);
+    };
+  }, [documentFile, updateExternalChange]);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -658,7 +1201,7 @@ export default function App() {
         saveSettings({ ...settingsRef.current, scrollPositions });
       }
 
-      if (dirtyRef.current && !allowWindowCloseRef.current) {
+      if (dirtyRef.current) {
         event.preventDefault();
         event.returnValue = "";
       }
@@ -820,12 +1363,10 @@ export default function App() {
       try {
         const appWindow = getCurrentWindow();
         unlistenClose = await appWindow.onCloseRequested(async (event) => {
-          if (allowWindowCloseRef.current || !dirtyRef.current) return;
           event.preventDefault();
-          await runGuardedAction(async () => {
-            allowWindowCloseRef.current = true;
-            await appWindow.close();
-          });
+          const shouldClose =
+            !dirtyRef.current || (await runGuardedAction(async () => true));
+          if (shouldClose) await invoke<void>("exit_application");
         });
         if (cancelled) unlistenClose();
       } catch {
@@ -1000,6 +1541,7 @@ export default function App() {
         readerMode={readerMode}
         dirty={isDirty}
         saving={saving}
+        saveStatus={saveStatus}
         canSearch={Boolean(documentFile)}
         canEdit={Boolean(documentFile)}
         onOpenFile={chooseFile}
@@ -1069,9 +1611,66 @@ export default function App() {
             </div>
           )}
 
+          {recoveryWarning && (
+            <div className="error-banner recovery-warning" role="status">
+              <AlertCircle size={17} />
+              <span>{recoveryWarning}</span>
+              <button
+                type="button"
+                onClick={() => setRecoveryWarning("")}
+                aria-label="Dismiss recovery warning"
+              >
+                <X size={16} />
+              </button>
+            </div>
+          )}
+
+          {notice && (
+            <div className="file-change-banner is-notice" role="status">
+              <span>{notice}</span>
+              <button type="button" onClick={() => setNotice("")}>Dismiss</button>
+            </div>
+          )}
+
+          {externalChange && !externalChange.dismissed && (
+            <div className="file-change-banner" role="status" aria-live="polite">
+              <span>
+                {externalChange.kind === "missing"
+                  ? "File no longer exists on disk. Your draft and recovery data are being kept."
+                  : isDirty
+                    ? settings.autoSaveEnabled
+                      ? "File changed externally — Auto Save paused"
+                      : "File changed externally — resolve before saving"
+                    : "File changed on disk"}
+              </span>
+              {externalChange.kind === "changed" && (
+                <button type="button" onClick={() => void reloadExternalChange()}>
+                  {isDirty ? "Resolve" : "Reload"}
+                </button>
+              )}
+              <button type="button" onClick={dismissExternalChange}>Dismiss</button>
+            </div>
+          )}
+
           {documentFile ? (
             readerMode === "edit" ? (
-              <MarkdownEditor value={draftContent} onChange={updateDraftContent} />
+              <EditWorkspace
+                content={draftContent}
+                previewContent={previewContent}
+                documentPath={documentFile.path}
+                theme={resolvedTheme}
+                layout={settings.editLayout}
+                splitRatio={settings.editorSplitRatio}
+                autoSaveEnabled={settings.autoSaveEnabled}
+                autoSaveDelayMs={settings.autoSaveDelayMs}
+                saveStatus={saveStatus}
+                onChange={updateDraftContent}
+                onLayoutChange={changeEditLayout}
+                onSplitRatioCommit={commitEditorSplitRatio}
+                onAutoSaveEnabledChange={changeAutoSaveEnabled}
+                onAutoSaveDelayChange={changeAutoSaveDelay}
+                onOpenMarkdown={(path) => void openDocument(path)}
+              />
             ) : (
               <MarkdownView
                 content={draftContent}

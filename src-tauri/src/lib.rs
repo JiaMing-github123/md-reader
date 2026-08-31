@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
     collections::HashSet,
@@ -15,6 +15,33 @@ struct MarkdownDocument {
     path: String,
     name: String,
     content: String,
+    revision: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct FileRevision {
+    status: FileRevisionStatus,
+    revision: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum FileRevisionStatus {
+    Exists,
+    Missing,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryDraft {
+    canonical_path: String,
+    filename: String,
+    draft_content: String,
+    base_revision: String,
+    updated_timestamp: u64,
+    app_version: String,
+    schema_version: u32,
 }
 
 #[derive(Serialize, PartialEq, Eq)]
@@ -59,6 +86,9 @@ struct WriteMarkdownError {
 }
 
 const IGNORED_DIRECTORIES: [&str; 4] = [".git", "node_modules", "dist", "target"];
+const RECOVERY_SCHEMA_VERSION: u32 = 1;
+const MAX_RECOVERY_DRAFTS: usize = 20;
+const RECOVERY_CLEANUP_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
 
 fn is_markdown_path(path: &Path) -> bool {
     path.extension()
@@ -89,6 +119,40 @@ fn normalized_utf8_content(path: &Path) -> io::Result<String> {
     fs::read_to_string(path).map(|content| content.trim_start_matches('\u{feff}').to_string())
 }
 
+fn fingerprint_bytes(bytes: &[u8]) -> u64 {
+    // Stable FNV-1a: unlike mtime or file length alone, this changes when equal-sized
+    // Markdown contents change and is deterministic across application launches.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn content_revision(content: &str) -> String {
+    format!("v1-{:016x}-{}", fingerprint_bytes(content.as_bytes()), content.len())
+}
+
+fn file_revision_impl(path: &Path) -> Result<FileRevision, String> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => {
+            let content = normalized_utf8_content(path)
+                .map_err(|error| format!("Could not read the file revision: {error}"))?;
+            Ok(FileRevision {
+                status: FileRevisionStatus::Exists,
+                revision: Some(content_revision(&content)),
+            })
+        }
+        Ok(_) => Err("The Markdown path is no longer an ordinary file.".to_string()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(FileRevision {
+            status: FileRevisionStatus::Missing,
+            revision: None,
+        }),
+        Err(error) => Err(format!("Could not inspect the file revision: {error}")),
+    }
+}
+
 fn markdown_document_from_path(path: &Path, content: String) -> MarkdownDocument {
     let name = path
         .file_name()
@@ -99,6 +163,7 @@ fn markdown_document_from_path(path: &Path, content: String) -> MarkdownDocument
     MarkdownDocument {
         path: path.to_string_lossy().into_owned(),
         name,
+        revision: content_revision(&content),
         content,
     }
 }
@@ -190,6 +255,295 @@ fn replace_file(temporary_path: &Path, target: &Path) -> io::Result<()> {
 #[cfg(not(windows))]
 fn replace_file(temporary_path: &Path, target: &Path) -> io::Result<()> {
     fs::rename(temporary_path, target)
+}
+
+fn recovery_path_identity(path: &str) -> Result<String, String> {
+    let requested = PathBuf::from(path);
+    if !requested.is_absolute() {
+        return Err("Recovery paths must be absolute document paths.".to_string());
+    }
+
+    let resolved = requested.canonicalize().unwrap_or(requested);
+    let identity = resolved.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    let identity = identity.replace('/', "\\").to_lowercase();
+    Ok(identity)
+}
+
+fn resolved_document_path(path: &str) -> Result<String, String> {
+    let requested = PathBuf::from(path);
+    if !requested.is_absolute() {
+        return Err("Recovery paths must be absolute document paths.".to_string());
+    }
+    Ok(requested
+        .canonicalize()
+        .unwrap_or(requested)
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn recovery_record_id(path: &str) -> Result<String, String> {
+    let identity = recovery_path_identity(path)?;
+    let first = fingerprint_bytes(identity.as_bytes());
+    let mut salted = b"md-reader-recovery-v1\0".to_vec();
+    salted.extend_from_slice(identity.as_bytes());
+    let second = fingerprint_bytes(&salted);
+    Ok(format!("{first:016x}{second:016x}"))
+}
+
+fn recovery_record_path(root: &Path, path: &str) -> Result<PathBuf, String> {
+    let id = recovery_record_id(path)?;
+    if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("The recovery record id is invalid.".to_string());
+    }
+    Ok(root.join(format!("{id}.json")))
+}
+
+fn create_recovery_temporary_file(root: &Path) -> Result<(PathBuf, File), String> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+
+    for attempt in 0..64_u8 {
+        let temporary_path = root.join(format!(
+            ".recovery-{}-{nonce}-{attempt}.tmp",
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+        {
+            Ok(file) => return Ok((temporary_path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "Could not create a temporary recovery file: {error}"
+                ));
+            }
+        }
+    }
+
+    Err("Could not create a unique temporary recovery file.".to_string())
+}
+
+fn atomic_write_recovery_with<F>(
+    root: &Path,
+    target: &Path,
+    bytes: &[u8],
+    replace: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&Path, &Path) -> io::Result<()>,
+{
+    fs::create_dir_all(root)
+        .map_err(|error| format!("Could not create the recovery directory: {error}"))?;
+    let (temporary_path, mut temporary_file) = create_recovery_temporary_file(root)?;
+    let write_result = temporary_file.write_all(bytes).and_then(|_| temporary_file.sync_all());
+    drop(temporary_file);
+
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(format!("Could not write the recovery draft safely: {error}"));
+    }
+
+    if let Err(error) = replace(&temporary_path, target) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(format!(
+            "Could not replace the recovery draft; the previous draft was preserved: {error}"
+        ));
+    }
+    Ok(())
+}
+
+fn atomic_write_recovery(root: &Path, target: &Path, bytes: &[u8]) -> Result<(), String> {
+    let target_exists = target.exists();
+    atomic_write_recovery_with(root, target, bytes, move |temporary_path, target_path| {
+        if target_exists {
+            replace_file(temporary_path, target_path)
+        } else {
+            fs::rename(temporary_path, target_path)
+        }
+    })
+}
+
+fn load_recovery_draft_impl(root: &Path, path: &str) -> Result<Option<RecoveryDraft>, String> {
+    let target = recovery_record_path(root, path)?;
+    let bytes = match fs::read(&target) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("Could not read this recovery draft: {error}")),
+    };
+    let record: RecoveryDraft = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "This recovery draft is damaged and was left untouched ({}): {error}",
+            target.to_string_lossy()
+        )
+    })?;
+    if record.schema_version != RECOVERY_SCHEMA_VERSION {
+        return Err(format!(
+            "This recovery draft uses unsupported schema version {} and was left untouched.",
+            record.schema_version
+        ));
+    }
+    if recovery_path_identity(&record.canonical_path)? != recovery_path_identity(path)? {
+        return Err("The recovery draft path does not match the requested document.".to_string());
+    }
+    Ok(Some(record))
+}
+
+fn delete_recovery_draft_impl(root: &Path, path: &str) -> Result<(), String> {
+    let target = recovery_record_path(root, path)?;
+    match fs::remove_file(target) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Could not delete the recovery draft: {error}")),
+    }
+}
+
+fn recovery_record_is_safe_to_clean(record: &RecoveryDraft, now: u64) -> bool {
+    if now.saturating_sub(record.updated_timestamp) < RECOVERY_CLEANUP_AGE_SECONDS {
+        return false;
+    }
+    normalized_utf8_content(Path::new(&record.canonical_path))
+        .map(|disk_content| disk_content == record.draft_content)
+        .unwrap_or(false)
+}
+
+fn ensure_recovery_capacity(root: &Path, target: &Path, now: u64) -> Result<(), String> {
+    if target.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(root)
+        .map_err(|error| format!("Could not create the recovery directory: {error}"))?;
+
+    let mut records = Vec::new();
+    for entry in fs::read_dir(root)
+        .map_err(|error| format!("Could not inspect recovery storage: {error}"))?
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let parsed = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<RecoveryDraft>(&bytes).ok());
+        records.push((path, parsed));
+    }
+
+    if records.len() < MAX_RECOVERY_DRAFTS {
+        return Ok(());
+    }
+
+    let mut cleanable: Vec<_> = records
+        .iter()
+        .filter_map(|(path, record)| {
+            let record = record.as_ref()?;
+            recovery_record_is_safe_to_clean(record, now)
+                .then_some((record.updated_timestamp, path.clone()))
+        })
+        .collect();
+    cleanable.sort_by_key(|(updated, _)| *updated);
+
+    let mut remaining = records.len();
+    for (_, path) in cleanable {
+        if remaining < MAX_RECOVERY_DRAFTS {
+            break;
+        }
+        if fs::remove_file(&path).is_ok() {
+            remaining -= 1;
+        }
+    }
+
+    if remaining >= MAX_RECOVERY_DRAFTS {
+        return Err(format!(
+            "Recovery storage already contains {MAX_RECOVERY_DRAFTS} protected unsaved drafts. No valid draft was deleted."
+        ));
+    }
+    Ok(())
+}
+
+fn save_recovery_draft_impl(
+    root: &Path,
+    path: &str,
+    draft_content: &str,
+    base_revision: &str,
+    now: u64,
+) -> Result<RecoveryDraft, String> {
+    let canonical_path = resolved_document_path(path)?;
+    let target = recovery_record_path(root, &canonical_path)?;
+    ensure_recovery_capacity(root, &target, now)?;
+    let filename = Path::new(&canonical_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("document.md")
+        .to_string();
+    let record = RecoveryDraft {
+        canonical_path,
+        filename,
+        draft_content: draft_content.to_string(),
+        base_revision: base_revision.to_string(),
+        updated_timestamp: now,
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        schema_version: RECOVERY_SCHEMA_VERSION,
+    };
+    let bytes = serde_json::to_vec_pretty(&record)
+        .map_err(|error| format!("Could not serialize the recovery draft: {error}"))?;
+    atomic_write_recovery(root, &target, &bytes)?;
+    Ok(record)
+}
+
+fn recovery_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|path| path.join("recovery"))
+        .map_err(|error| format!("Could not resolve the application data directory: {error}"))
+}
+
+#[tauri::command]
+fn save_recovery_draft(
+    app: tauri::AppHandle,
+    path: String,
+    draft_content: String,
+    base_revision: String,
+) -> Result<RecoveryDraft, String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    save_recovery_draft_impl(
+        &recovery_root(&app)?,
+        &path,
+        &draft_content,
+        &base_revision,
+        now,
+    )
+}
+
+#[tauri::command]
+fn load_recovery_draft(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<Option<RecoveryDraft>, String> {
+    load_recovery_draft_impl(&recovery_root(&app)?, &path)
+}
+
+#[tauri::command]
+fn delete_recovery_draft(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    delete_recovery_draft_impl(&recovery_root(&app)?, &path)
+}
+
+#[tauri::command]
+fn get_file_revision(path: String) -> Result<FileRevision, String> {
+    file_revision_impl(Path::new(&path))
+}
+
+#[tauri::command]
+fn exit_application(app: tauri::AppHandle) {
+    app.exit(0);
 }
 
 fn write_markdown_file_impl(
@@ -525,6 +879,276 @@ mod tests {
     }
 
     #[test]
+    fn saves_loads_and_deletes_recovery_draft() {
+        let temporary = TestDirectory::new("recovery-lifecycle");
+        let recovery = temporary.path.join("recovery");
+        let document = temporary.path.join("notes.md");
+        fs::write(&document, "disk").unwrap();
+
+        let saved = save_recovery_draft_impl(
+            &recovery,
+            document.to_str().unwrap(),
+            "local draft",
+            "revision-before",
+            1234,
+        )
+        .unwrap();
+        assert_eq!(saved.draft_content, "local draft");
+        assert_eq!(saved.schema_version, RECOVERY_SCHEMA_VERSION);
+
+        let loaded = load_recovery_draft_impl(&recovery, document.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded, saved);
+
+        delete_recovery_draft_impl(&recovery, document.to_str().unwrap()).unwrap();
+        assert!(load_recovery_draft_impl(&recovery, document.to_str().unwrap())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn recovery_supports_unicode_paths_and_content() {
+        let temporary = TestDirectory::new("recovery-unicode");
+        let recovery = temporary.path.join("恢复草稿");
+        let document = temporary.path.join("中文笔记.md");
+        fs::write(&document, "磁盘内容").unwrap();
+        let draft = "# 恢复\n\n你好，世界 🌏";
+
+        save_recovery_draft_impl(
+            &recovery,
+            document.to_str().unwrap(),
+            draft,
+            "版本一",
+            4567,
+        )
+        .unwrap();
+        let loaded = load_recovery_draft_impl(&recovery, document.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.filename, "中文笔记.md");
+        assert_eq!(loaded.draft_content, draft);
+    }
+
+    #[test]
+    fn damaged_recovery_record_does_not_remove_other_records() {
+        let temporary = TestDirectory::new("recovery-damage");
+        let recovery = temporary.path.join("recovery");
+        let first = temporary.path.join("first.md");
+        let second = temporary.path.join("second.md");
+        fs::write(&first, "first disk").unwrap();
+        fs::write(&second, "second disk").unwrap();
+        save_recovery_draft_impl(
+            &recovery,
+            first.to_str().unwrap(),
+            "first draft",
+            "r1",
+            1,
+        )
+        .unwrap();
+        save_recovery_draft_impl(
+            &recovery,
+            second.to_str().unwrap(),
+            "second draft",
+            "r2",
+            2,
+        )
+        .unwrap();
+
+        let damaged_path = recovery_record_path(&recovery, first.to_str().unwrap()).unwrap();
+        fs::write(&damaged_path, b"{not valid json").unwrap();
+        let error = load_recovery_draft_impl(&recovery, first.to_str().unwrap()).unwrap_err();
+        assert!(error.contains("damaged"));
+        assert!(damaged_path.exists());
+        assert_eq!(
+            load_recovery_draft_impl(&recovery, second.to_str().unwrap())
+                .unwrap()
+                .unwrap()
+                .draft_content,
+            "second draft"
+        );
+    }
+
+    #[test]
+    fn failed_recovery_replace_preserves_previous_record() {
+        let temporary = TestDirectory::new("recovery-atomic-failure");
+        let recovery = temporary.path.join("recovery");
+        fs::create_dir_all(&recovery).unwrap();
+        let target = recovery.join("record.json");
+        fs::write(&target, b"previous valid record").unwrap();
+
+        let error = atomic_write_recovery_with(
+            &recovery,
+            &target,
+            b"new record",
+            |_temporary, _target| Err(io::Error::new(io::ErrorKind::Other, "injected failure")),
+        )
+        .unwrap_err();
+        assert!(error.contains("previous draft was preserved"));
+        assert_eq!(fs::read(&target).unwrap(), b"previous valid record");
+    }
+
+    #[test]
+    fn recovery_paths_cannot_escape_storage_directory() {
+        let temporary = TestDirectory::new("recovery-path-safety");
+        let recovery = temporary.path.join("recovery");
+        assert!(recovery_record_path(&recovery, "..\\escape.md").is_err());
+
+        let outside = temporary.path.join("nested").join("..").join("outside.md");
+        let target = recovery_record_path(&recovery, outside.to_str().unwrap()).unwrap();
+        assert_eq!(target.parent(), Some(recovery.as_path()));
+        let filename = target.file_name().unwrap().to_string_lossy();
+        assert!(filename.ends_with(".json"));
+        assert!(!filename.contains(".."));
+        assert!(!filename.contains('/') && !filename.contains('\\'));
+    }
+
+    #[test]
+    fn recovery_capacity_only_removes_old_drafts_already_on_disk() {
+        let temporary = TestDirectory::new("recovery-capacity");
+        let recovery = temporary.path.join("recovery");
+        let now = RECOVERY_CLEANUP_AGE_SECONDS + 10_000;
+        let mut paths = Vec::new();
+
+        for index in 0..MAX_RECOVERY_DRAFTS {
+            let document = temporary.path.join(format!("note-{index}.md"));
+            fs::write(&document, "disk").unwrap();
+            save_recovery_draft_impl(
+                &recovery,
+                document.to_str().unwrap(),
+                &format!("draft-{index}"),
+                "base",
+                if index == 0 { 1 } else { now },
+            )
+            .unwrap();
+            paths.push(document);
+        }
+
+        let newest = temporary.path.join("newest.md");
+        fs::write(&newest, "disk").unwrap();
+        let capacity_error = save_recovery_draft_impl(
+            &recovery,
+            newest.to_str().unwrap(),
+            "newest draft",
+            "base",
+            now,
+        )
+        .unwrap_err();
+        assert!(capacity_error.contains("No valid draft was deleted"));
+
+        // Only this old record is safe: its recovered content is already on disk.
+        fs::write(&paths[0], "draft-0").unwrap();
+        save_recovery_draft_impl(
+            &recovery,
+            newest.to_str().unwrap(),
+            "newest draft",
+            "base",
+            now,
+        )
+        .unwrap();
+
+        assert!(load_recovery_draft_impl(&recovery, paths[0].to_str().unwrap())
+            .unwrap()
+            .is_none());
+        assert!(load_recovery_draft_impl(&recovery, paths[1].to_str().unwrap())
+            .unwrap()
+            .is_some());
+        assert!(load_recovery_draft_impl(&recovery, newest.to_str().unwrap())
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            fs::read_dir(&recovery)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("json"))
+                .count(),
+            MAX_RECOVERY_DRAFTS
+        );
+    }
+
+    #[test]
+    fn revision_detects_equal_length_content_changes_and_deletion() {
+        let temporary = TestDirectory::new("revision");
+        let document = temporary.path.join("notes.md");
+        fs::write(&document, "alpha").unwrap();
+        let first = file_revision_impl(&document).unwrap();
+        fs::write(&document, "bravo").unwrap();
+        let second = file_revision_impl(&document).unwrap();
+        assert_eq!(first.status, FileRevisionStatus::Exists);
+        assert_eq!(second.status, FileRevisionStatus::Exists);
+        assert_ne!(first.revision, second.revision);
+
+        fs::remove_file(&document).unwrap();
+        assert_eq!(
+            file_revision_impl(&document).unwrap(),
+            FileRevision {
+                status: FileRevisionStatus::Missing,
+                revision: None,
+            }
+        );
+    }
+
+    #[test]
+    fn save_conflict_preserves_original_and_recovery_draft() {
+        let temporary = TestDirectory::new("save-conflict-recovery");
+        let recovery = temporary.path.join("recovery");
+        let document = temporary.path.join("notes.md");
+        fs::write(&document, "original").unwrap();
+        save_recovery_draft_impl(
+            &recovery,
+            document.to_str().unwrap(),
+            "local draft",
+            "base",
+            10,
+        )
+        .unwrap();
+        fs::write(&document, "external").unwrap();
+
+        let error = write_markdown_file_impl(
+            document.to_str().unwrap(),
+            "local draft",
+            "original",
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, WriteErrorKind::Conflict);
+        assert_eq!(fs::read_to_string(&document).unwrap(), "external");
+        assert!(load_recovery_draft_impl(&recovery, document.to_str().unwrap())
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn write_failure_preserves_original_bytes_and_recovery_draft() {
+        let temporary = TestDirectory::new("write-failure-recovery");
+        let recovery = temporary.path.join("recovery");
+        let document = temporary.path.join("invalid.md");
+        let original = [0xff, 0xfe, 0x00, 0x61];
+        fs::write(&document, original).unwrap();
+        save_recovery_draft_impl(
+            &recovery,
+            document.to_str().unwrap(),
+            "protected local draft",
+            "base",
+            11,
+        )
+        .unwrap();
+
+        let error = write_markdown_file_impl(
+            document.to_str().unwrap(),
+            "replacement",
+            "expected",
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, WriteErrorKind::WriteFailure);
+        assert_eq!(fs::read(&document).unwrap(), original);
+        assert!(load_recovery_draft_impl(&recovery, document.to_str().unwrap())
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
     fn scans_nested_markdown_files_in_stable_folder_first_order() {
         let temporary = TestDirectory::new("scan");
         let root = temporary.path.clone();
@@ -696,7 +1320,12 @@ pub fn run() {
             classify_path,
             scan_markdown_folder,
             read_markdown_file,
-            write_markdown_file
+            write_markdown_file,
+            save_recovery_draft,
+            load_recovery_draft,
+            delete_recovery_draft,
+            get_file_revision,
+            exit_application
         ])
         .run(tauri::generate_context!())
         .expect("error while running MD Reader");
