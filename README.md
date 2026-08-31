@@ -6,6 +6,15 @@ MD Reader turns local `.md` and `.markdown` files into a focused reading and wri
 
 There are no accounts, analytics, telemetry, database, sync service, or backend server. Settings and recovery drafts stay on your computer. A document can still load a remote image or open an external link when its Markdown explicitly references one.
 
+## Download
+
+| Windows build | Download | Best for |
+| --- | --- | --- |
+| Installer | **[Download MD Reader Setup](https://github.com/JiaMing-github123/md-reader/releases/latest/download/MD-Reader-Setup.exe)** | Most users; installs the app and registers Markdown file associations |
+| Portable | **[Download MD Reader Portable](https://github.com/JiaMing-github123/md-reader/releases/latest/download/MD-Reader-Portable.exe)** | Run directly without an installer |
+
+You can also browse the [release history](https://github.com/JiaMing-github123/md-reader/releases). Windows may show an unknown-publisher warning because the current builds are not code-signed.
+
 ## Highlights
 
 ### Read comfortably
