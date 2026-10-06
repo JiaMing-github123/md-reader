@@ -4,6 +4,7 @@ import { ImageOff } from "lucide-react";
 import {
   Children,
   isValidElement,
+  memo,
   useEffect,
   useMemo,
   useState,
@@ -85,7 +86,8 @@ interface MarkdownViewProps {
   onOpenMarkdown: (path: string) => void;
 }
 
-export function MarkdownView({
+// Keep scroll, search and editor state updates outside the Markdown parser.
+export const MarkdownView = memo(function MarkdownView({
   content,
   documentPath,
   theme,
@@ -163,5 +165,4 @@ export function MarkdownView({
       </ReactMarkdown>
     </article>
   );
-}
-
+});

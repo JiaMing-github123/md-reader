@@ -5,4 +5,5 @@ src-tauri/gen/
 .vite/
 .tools/
 *.log
+MD-Reader-Portable*.exe
 .DS_Store

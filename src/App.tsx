@@ -201,9 +201,11 @@ export default function App() {
             ? "Unsaved"
             : "Saved";
 
+  // The contents sidebar is absent while editing. Keep keystrokes off the parser.
+  const tocContent = readerMode === "read" ? draftContent : "";
   const tableOfContents = useMemo(
-    () => extractTableOfContents(draftContent),
-    [draftContent],
+    () => (tocContent ? extractTableOfContents(tocContent) : []),
+    [tocContent],
   );
 
   const search = useDocumentSearch(
@@ -293,18 +295,31 @@ export default function App() {
 
   const schedulePreviewContent = useCallback((content: string) => {
     window.clearTimeout(previewTimerRef.current);
+    previewTimerRef.current = undefined;
     const updateEpoch = ++previewUpdateEpochRef.current;
     const documentPath = documentFileRef.current?.path ?? "";
+    const documentToken = documentTokenRef.current;
+    const draftVersion = draftVersionRef.current;
 
     if (!documentPath) {
-      previewTimerRef.current = undefined;
       setPreviewContent("");
+      return;
+    }
+
+    if (
+      readerModeRef.current !== "edit" ||
+      settingsRef.current.editLayout === "editor"
+    ) {
       return;
     }
 
     previewTimerRef.current = window.setTimeout(() => {
       if (
         updateEpoch !== previewUpdateEpochRef.current ||
+        documentToken !== documentTokenRef.current ||
+        draftVersion !== draftVersionRef.current ||
+        readerModeRef.current !== "edit" ||
+        settingsRef.current.editLayout === "editor" ||
         comparablePath(documentFileRef.current?.path ?? "") !== comparablePath(documentPath)
       ) {
         return;
@@ -808,6 +823,11 @@ export default function App() {
     [loadDocument, runGuardedAction],
   );
 
+  const openMarkdownLink = useCallback(
+    (path: string) => void openDocument(path),
+    [openDocument],
+  );
+
   const openFolder = useCallback(
     (path: string, options: OpenFolderOptions = {}) =>
       runGuardedAction(() => loadFolder(path, options)),
@@ -887,12 +907,13 @@ export default function App() {
 
   const changeEditLayout = useCallback(
     (editLayout: EditLayout) => {
-      if (editLayout !== "editor") syncPreviewContent(draftContentRef.current);
+      if (editLayout === "editor") cancelPendingPreview();
+      else syncPreviewContent(draftContentRef.current);
       updateSettings((current) =>
         current.editLayout === editLayout ? current : { ...current, editLayout },
       );
     },
-    [syncPreviewContent, updateSettings],
+    [cancelPendingPreview, syncPreviewContent, updateSettings],
   );
 
   const commitEditorSplitRatio = useCallback(
@@ -926,6 +947,7 @@ export default function App() {
       if (mode === "edit" && !documentFileRef.current) return;
       if (readerModeRef.current === mode) return;
 
+      cancelPendingPreview();
       if (mode === "edit") {
         flushCurrentScrollPosition();
         closeSearch();
@@ -946,7 +968,7 @@ export default function App() {
       readerModeRef.current = mode;
       setReaderMode(mode);
     },
-    [closeSearch, flushCurrentScrollPosition, folderTree, syncPreviewContent],
+    [cancelPendingPreview, closeSearch, flushCurrentScrollPosition, folderTree, syncPreviewContent],
   );
 
   const openSearch = useCallback(() => {
@@ -1693,7 +1715,7 @@ export default function App() {
                 onSplitRatioCommit={commitEditorSplitRatio}
                 onAutoSaveEnabledChange={changeAutoSaveEnabled}
                 onAutoSaveDelayChange={changeAutoSaveDelay}
-                onOpenMarkdown={(path) => void openDocument(path)}
+                onOpenMarkdown={openMarkdownLink}
               />
             ) : (
               <MarkdownView
@@ -1701,7 +1723,7 @@ export default function App() {
                 documentPath={documentFile.path}
                 theme={resolvedTheme}
                 articleRef={articleRef}
-                onOpenMarkdown={(path) => void openDocument(path)}
+                onOpenMarkdown={openMarkdownLink}
               />
             )
           ) : (

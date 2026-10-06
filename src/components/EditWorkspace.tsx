@@ -154,11 +154,13 @@ export function EditWorkspace({
   );
 
   const captureViewState = useCallback(() => {
-    if (editorRef.current) editorViewRef.current = editorRef.current.getViewState();
-    if (previewScrollRef.current) {
+    if (layout !== "preview" && editorRef.current) {
+      editorViewRef.current = editorRef.current.getViewState();
+    }
+    if (layout !== "editor" && previewScrollRef.current) {
       previewScrollTopRef.current = previewScrollRef.current.scrollTop;
     }
-  }, []);
+  }, [layout]);
 
   const restoreVisibleViewState = useCallback((nextLayout: EditLayout) => {
     requestAnimationFrame(() => {
@@ -343,18 +345,23 @@ export function EditWorkspace({
           aria-label="Markdown preview"
           aria-hidden={layout === "editor"}
           onScroll={(event) => {
-            previewScrollTopRef.current = event.currentTarget.scrollTop;
+            // Unmounting the hidden article may reset its pane's scroll position.
+            if (layout !== "editor") {
+              previewScrollTopRef.current = event.currentTarget.scrollTop;
+            }
           }}
         >
-          <PreviewErrorBoundary resetKey={`${documentPath}\u0000${previewContent}`}>
-            <MarkdownView
-              content={previewContent}
-              documentPath={documentPath}
-              theme={theme}
-              articleRef={previewArticleRef}
-              onOpenMarkdown={onOpenMarkdown}
-            />
-          </PreviewErrorBoundary>
+          {layout !== "editor" && (
+            <PreviewErrorBoundary resetKey={`${documentPath}\u0000${previewContent}`}>
+              <MarkdownView
+                content={previewContent}
+                documentPath={documentPath}
+                theme={theme}
+                articleRef={previewArticleRef}
+                onOpenMarkdown={onOpenMarkdown}
+              />
+            </PreviewErrorBoundary>
+          )}
         </div>
       </div>
     </section>

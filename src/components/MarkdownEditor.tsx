@@ -1,5 +1,6 @@
 import {
   forwardRef,
+  memo,
   useCallback,
   useImperativeHandle,
   useRef,
@@ -31,7 +32,7 @@ const EMPTY_VIEW_STATE: MarkdownEditorViewState = {
   scrollTop: 0,
 };
 
-export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorProps>(
+export const MarkdownEditor = memo(forwardRef<MarkdownEditorHandle, MarkdownEditorProps>(
   function MarkdownEditor({ value, onChange, visible }, ref) {
     const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -105,4 +106,4 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
       </div>
     );
   },
-);
+));
