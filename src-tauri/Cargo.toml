@@ -1,6 +1,6 @@
 [package]
 name = "md-reader"
-version = "0.5.2"
+version = "0.5.3"
 description = "A lightweight personal Markdown reader for Windows"
 authors = ["MD Reader"]
 edition = "2021"
