@@ -24,6 +24,7 @@ You can also browse the [release history](https://github.com/JiaMing-github123/m
 - Search the current document with highlighted matches and next/previous navigation.
 - Choose light, dark, or system theme, resize the reading text, and resume from remembered scroll positions.
 - Copy code blocks with one click and follow relative links to other Markdown files.
+- Highlight code near the reading or preview viewport; blocks over 20,000 characters or 400 lines stay as complete plain text. See the [performance measurements](docs/highlight-performance.md).
 
 ### Work across a folder
 

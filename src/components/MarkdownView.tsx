@@ -24,7 +24,7 @@ import {
   resolveLocalPath,
   sanitizeMarkdownUrl,
 } from "../lib/markdown";
-import { CodeBlock } from "./CodeBlock";
+import { CodeBlock, codeHighlightStyles } from "./CodeBlock";
 
 const sanitizeSchema = {
   ...defaultSchema,
@@ -83,6 +83,7 @@ interface MarkdownViewProps {
   documentPath: string;
   theme: ResolvedTheme;
   articleRef: React.RefObject<HTMLElement>;
+  scrollRef: React.RefObject<HTMLElement>;
   onOpenMarkdown: (path: string) => void;
 }
 
@@ -92,6 +93,7 @@ export const MarkdownView = memo(function MarkdownView({
   documentPath,
   theme,
   articleRef,
+  scrollRef,
   onOpenMarkdown,
 }: MarkdownViewProps) {
   const components = useMemo<Components>(
@@ -145,24 +147,27 @@ export const MarkdownView = memo(function MarkdownView({
         if (!isValidElement(child)) return <pre>{children}</pre>;
         const language = child.props.className?.match(/language-([\w-]+)/)?.[1];
         const code = String(child.props.children ?? "").replace(/\n$/, "");
-        return <CodeBlock code={code} language={language} theme={theme} />;
+        return <CodeBlock code={code} language={language} scrollRef={scrollRef} />;
       },
     }),
-    [documentPath, onOpenMarkdown, theme],
+    [documentPath, onOpenMarkdown, scrollRef],
   );
 
   return (
-    <article ref={articleRef} className="markdown-body">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        rehypePlugins={[[rehypeSanitize, sanitizeSchema], rehypeSlug]}
-        components={components}
-        urlTransform={(url, _key, node: Element) =>
-          sanitizeMarkdownUrl(url, node.tagName === "img")
-        }
-      >
-        {content}
-      </ReactMarkdown>
-    </article>
+    <>
+      <style>{codeHighlightStyles}</style>
+      <article key={documentPath} ref={articleRef} className="markdown-body" data-code-theme={theme}>
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          rehypePlugins={[[rehypeSanitize, sanitizeSchema], rehypeSlug]}
+          components={components}
+          urlTransform={(url, _key, node: Element) =>
+            sanitizeMarkdownUrl(url, node.tagName === "img")
+          }
+        >
+          {content}
+        </ReactMarkdown>
+      </article>
+    </>
   );
 });

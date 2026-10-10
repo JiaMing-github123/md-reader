@@ -1041,17 +1041,26 @@ a:focus-visible {
   color: var(--text);
 }
 
-.code-block > div:last-child {
-  overflow: auto !important;
-}
-
-.code-block__plain {
+.code-block__content {
   overflow: auto;
   margin: 0;
   padding: 1rem 1.1rem 1.15rem;
   background: transparent;
   font-size: 0.84em;
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  line-height: 1.65;
+  tab-size: 2;
+  word-break: normal;
+  word-spacing: normal;
+  text-align: left;
+  direction: ltr;
+  hyphens: none;
   white-space: pre;
+}
+
+.code-block__content code {
+  font: inherit;
+  white-space: inherit;
 }
 
 .markdown-table-wrap {

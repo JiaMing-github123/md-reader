@@ -214,7 +214,7 @@ export default function App() {
     readerMode === "read" && searchOpen ? searchQuery : "",
     documentFile?.path ?? "",
     draftContent,
-    `${resolvedTheme}:${readerMode}`,
+    readerMode,
   );
 
   const updateSettings = useCallback(
@@ -1723,6 +1723,7 @@ export default function App() {
                 documentPath={documentFile.path}
                 theme={resolvedTheme}
                 articleRef={articleRef}
+                scrollRef={scrollRef}
                 onOpenMarkdown={openMarkdownLink}
               />
             )

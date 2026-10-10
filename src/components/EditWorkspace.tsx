@@ -358,6 +358,7 @@ export function EditWorkspace({
                 documentPath={documentPath}
                 theme={theme}
                 articleRef={previewArticleRef}
+                scrollRef={previewScrollRef}
                 onOpenMarkdown={onOpenMarkdown}
               />
             </PreviewErrorBoundary>

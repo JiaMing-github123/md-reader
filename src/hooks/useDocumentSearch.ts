@@ -5,9 +5,15 @@ interface HighlightRegistry {
   delete(name: string): void;
 }
 
-interface SearchableTextNode {
+interface TextSegment {
   node: Text;
-  foldedText: string;
+  start: number;
+  end: number;
+}
+
+interface SearchableTextGroup {
+  text: string;
+  segments: TextSegment[];
 }
 
 type HighlightConstructor = new (...ranges: Range[]) => unknown;
@@ -16,6 +22,8 @@ const RESULTS_HIGHLIGHT = "md-reader-search-results";
 const ACTIVE_HIGHLIGHT = "md-reader-search-active";
 const SEARCH_DEBOUNCE_MS = 150;
 const MAX_HIGHLIGHT_RANGES = 2000;
+const SEARCH_EXCLUDE = "[data-search-exclude], svg, script, style";
+const SEARCH_GROUP = "[data-code-content], pre, p, h1, h2, h3, h4, h5, h6, li, td, th, blockquote";
 
 function highlightApi(): {
   registry: HighlightRegistry | null;
@@ -33,59 +41,75 @@ function clearHighlights(): void {
   registry?.delete(ACTIVE_HIGHLIGHT);
 }
 
-function buildSearchIndex(container: HTMLElement): SearchableTextNode[] {
-  const nodes: SearchableTextNode[] = [];
+// A code block (or paragraph) remains one searchable string when token spans replace
+// plain text. Segment offsets map matches, including cross-token matches, back to DOM.
+function buildSearchIndex(container: HTMLElement): SearchableTextGroup[] {
+  const groups: SearchableTextGroup[] = [];
   const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
-      const parent = node.parentElement;
-      if (
-        !parent ||
-        parent.closest("[data-search-exclude]") ||
-        parent.closest("svg, script, style") ||
-        !node.textContent?.trim()
-      ) {
-        return NodeFilter.FILTER_REJECT;
-      }
-      return NodeFilter.FILTER_ACCEPT;
+      return !node.textContent || node.parentElement?.closest(SEARCH_EXCLUDE)
+        ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
     },
   });
-
+  let owner: Element | null = null;
+  let group: SearchableTextGroup | undefined;
   let node = walker.nextNode();
   while (node) {
+    const nextOwner = node.parentElement?.closest(SEARCH_GROUP) ?? container;
+    if (!group || owner !== nextOwner) {
+      group = { text: "", segments: [] };
+      groups.push(group);
+      owner = nextOwner;
+    }
     const text = node.textContent ?? "";
-    nodes.push({ node: node as Text, foldedText: text.toLocaleLowerCase() });
+    const start = group.text.length;
+    group.text += text;
+    group.segments.push({ node: node as Text, start, end: start + text.length });
     node = walker.nextNode();
   }
+  return groups.filter((entry) => entry.text.trim());
+}
 
-  return nodes;
+function segmentAt(segments: TextSegment[], offset: number): TextSegment {
+  let low = 0;
+  let high = segments.length - 1;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (segments[middle].end <= offset) low = middle + 1;
+    else high = middle;
+  }
+  return segments[low];
 }
 
 function findRanges(
-  index: SearchableTextNode[],
+  index: SearchableTextGroup[],
   query: string,
 ): { ranges: Range[]; limitExceeded: boolean } {
   const ranges: Range[] = [];
-  const needle = query.toLocaleLowerCase();
-  if (!needle) return { ranges, limitExceeded: false };
-
+  // Match against original UTF-16 offsets: lowercasing can change a character's
+  // length (for example U+0130) and produce invalid Range offsets.
+  const pattern = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "giu");
   for (const entry of index) {
-    let start = 0;
-    while (start <= entry.foldedText.length - needle.length) {
-      const matchIndex = entry.foldedText.indexOf(needle, start);
-      if (matchIndex < 0) break;
-      if (ranges.length === MAX_HIGHLIGHT_RANGES) {
-        return { ranges, limitExceeded: true };
-      }
-
+    pattern.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(entry.text))) {
+      if (ranges.length === MAX_HIGHLIGHT_RANGES) return { ranges, limitExceeded: true };
+      const start = match.index;
+      const end = start + match[0].length;
+      const first = segmentAt(entry.segments, start);
+      const last = segmentAt(entry.segments, end - 1);
       const range = document.createRange();
-      range.setStart(entry.node, matchIndex);
-      range.setEnd(entry.node, matchIndex + needle.length);
+      range.setStart(first.node, start - first.start);
+      range.setEnd(last.node, end - last.start);
       ranges.push(range);
-      start = matchIndex + needle.length;
     }
   }
-
   return { ranges, limitExceeded: false };
+}
+
+function affectsSearch(record: MutationRecord): boolean {
+  const element = record.target instanceof Element ? record.target : record.target.parentElement;
+  return !element?.closest(SEARCH_EXCLUDE);
 }
 
 export function useDocumentSearch(
@@ -96,21 +120,40 @@ export function useDocumentSearch(
   documentContent: string,
   renderKey: string,
 ) {
-  const indexRef = useRef<SearchableTextNode[]>([]);
+  const indexRef = useRef<SearchableTextGroup[]>([]);
+  const indexDirtyRef = useRef(true);
   const rangesRef = useRef<Range[]>([]);
-  const searchGenerationRef = useRef(0);
+  const observerRef = useRef<MutationObserver | null>(null);
+  const scheduleSearchRef = useRef<(() => void) | null>(null);
+  const refreshSearchRef = useRef<(() => void) | null>(null);
+  const currentMatchRef = useRef(0);
+  const scrollToMatchRef = useRef(false);
   const [matchCount, setMatchCount] = useState(0);
   const [matchLimitExceeded, setMatchLimitExceeded] = useState(false);
   const [currentMatch, setCurrentMatch] = useState(0);
+  const [rangeRevision, setRangeRevision] = useState(0);
 
   useEffect(() => {
-    searchGenerationRef.current += 1;
-    clearHighlights();
+    indexRef.current = [];
+    indexDirtyRef.current = true;
     rangesRef.current = [];
-    indexRef.current = articleRef.current ? buildSearchIndex(articleRef.current) : [];
-
+    clearHighlights();
+    const article = articleRef.current;
+    if (!article) return;
+    const observer = new MutationObserver((records) => {
+      if (!records.some(affectsSearch)) return;
+      indexDirtyRef.current = true;
+      indexRef.current = [];
+      rangesRef.current = [];
+      clearHighlights();
+      // No search -> no scan. A burst of highlights shares one trailing debounce.
+      scheduleSearchRef.current?.();
+    });
+    observer.observe(article, { childList: true, characterData: true, subtree: true });
+    observerRef.current = observer;
     return () => {
-      searchGenerationRef.current += 1;
+      observer.disconnect();
+      observerRef.current = null;
       indexRef.current = [];
       rangesRef.current = [];
       clearHighlights();
@@ -118,85 +161,93 @@ export function useDocumentSearch(
   }, [articleRef, documentContent, documentKey, renderKey]);
 
   useEffect(() => {
-    const generation = ++searchGenerationRef.current;
-    clearHighlights();
-    rangesRef.current = [];
+    let timer: number | undefined;
+    let cancelled = false;
+    const normalizedQuery = query.trim();
+    scrollToMatchRef.current = true;
+    currentMatchRef.current = 0;
+    setCurrentMatch(0);
     setMatchCount(0);
     setMatchLimitExceeded(false);
-    setCurrentMatch(0);
+    rangesRef.current = [];
+    clearHighlights();
 
-    const normalizedQuery = query.trim();
-    if (!normalizedQuery || !documentKey) return;
-
-    const timer = window.setTimeout(() => {
-      if (generation !== searchGenerationRef.current) return;
+    const refresh = () => {
+      window.clearTimeout(timer);
+      if (cancelled || !normalizedQuery || !documentKey) return;
+      const article = articleRef.current;
+      if (!article) return;
+      if (observerRef.current?.takeRecords().some(affectsSearch)) indexDirtyRef.current = true;
+      if (indexDirtyRef.current) {
+        indexRef.current = buildSearchIndex(article);
+        indexDirtyRef.current = false;
+      }
       const { ranges, limitExceeded } = findRanges(indexRef.current, normalizedQuery);
-      if (generation !== searchGenerationRef.current) return;
-
       rangesRef.current = ranges;
+      const active = Math.min(currentMatchRef.current, Math.max(ranges.length - 1, 0));
+      currentMatchRef.current = active;
+      setCurrentMatch(active);
       setMatchCount(ranges.length);
       setMatchLimitExceeded(limitExceeded);
-
+      setRangeRevision((revision) => revision + 1);
       const { registry, Highlight } = highlightApi();
-      if (registry && Highlight && ranges.length > 0) {
+      clearHighlights();
+      if (registry && Highlight && ranges.length) {
         registry.set(RESULTS_HIGHLIGHT, new Highlight(...ranges));
       }
-    }, SEARCH_DEBOUNCE_MS);
-
-    return () => {
+    };
+    const schedule = () => {
       window.clearTimeout(timer);
-      if (generation === searchGenerationRef.current) {
-        searchGenerationRef.current += 1;
-      }
+      if (normalizedQuery && documentKey) timer = window.setTimeout(refresh, SEARCH_DEBOUNCE_MS);
+    };
+    refreshSearchRef.current = refresh;
+    scheduleSearchRef.current = schedule;
+    schedule();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      refreshSearchRef.current = null;
+      scheduleSearchRef.current = null;
       clearHighlights();
     };
-  }, [documentContent, documentKey, query, renderKey]);
+  }, [articleRef, documentContent, documentKey, query, renderKey]);
 
   useEffect(() => {
-    const ranges = rangesRef.current;
-    const range = ranges[currentMatch];
+    const range = rangesRef.current[currentMatch];
     const { registry, Highlight } = highlightApi();
     registry?.delete(ACTIVE_HIGHLIGHT);
-
     if (!range) return;
-    if (registry && Highlight) {
-      registry.set(ACTIVE_HIGHLIGHT, new Highlight(range));
-    }
-
+    if (registry && Highlight) registry.set(ACTIVE_HIGHLIGHT, new Highlight(range));
+    // Replacing token nodes must restore paint without pulling a manually scrolled
+    // reader back to its old active match. Only a new query or navigation scrolls.
+    if (!scrollToMatchRef.current) return;
+    scrollToMatchRef.current = false;
     const scrollContainer = scrollRef.current;
     if (!scrollContainer) return;
     const matchRect = range.getBoundingClientRect();
     const containerRect = scrollContainer.getBoundingClientRect();
-    const isOutside =
-      matchRect.top < containerRect.top + 64 || matchRect.bottom > containerRect.bottom - 40;
-
-    if (isOutside) {
+    if (matchRect.top < containerRect.top + 64 || matchRect.bottom > containerRect.bottom - 40) {
       scrollContainer.scrollTo({
-        top:
-          scrollContainer.scrollTop +
-          matchRect.top -
-          containerRect.top -
-          containerRect.height * 0.28,
+        top: scrollContainer.scrollTop + matchRect.top - containerRect.top - containerRect.height * 0.28,
         behavior: "smooth",
       });
     }
-  }, [currentMatch, matchCount, scrollRef]);
+  }, [currentMatch, rangeRevision, scrollRef]);
 
-  const next = useCallback(() => {
-    if (matchCount === 0) return;
-    setCurrentMatch((current) => (current + 1) % matchCount);
-  }, [matchCount]);
+  const navigate = useCallback((direction: number) => {
+    // Navigation never uses detached nodes, even before the mutation debounce fires.
+    if (observerRef.current?.takeRecords().some(affectsSearch)) indexDirtyRef.current = true;
+    if (indexDirtyRef.current) refreshSearchRef.current?.();
+    const count = rangesRef.current.length;
+    if (!count) return;
+    const next = (currentMatchRef.current + direction + count) % count;
+    scrollToMatchRef.current = true;
+    currentMatchRef.current = next;
+    setCurrentMatch(next);
+    setRangeRevision((revision) => revision + 1);
+  }, []);
+  const next = useCallback(() => navigate(1), [navigate]);
+  const previous = useCallback(() => navigate(-1), [navigate]);
 
-  const previous = useCallback(() => {
-    if (matchCount === 0) return;
-    setCurrentMatch((current) => (current - 1 + matchCount) % matchCount);
-  }, [matchCount]);
-
-  return {
-    matchCount,
-    matchLimitExceeded,
-    currentMatch: matchCount > 0 ? currentMatch + 1 : 0,
-    next,
-    previous,
-  };
+  return { matchCount, matchLimitExceeded, currentMatch: matchCount > 0 ? currentMatch + 1 : 0, next, previous };
 }
